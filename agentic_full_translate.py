@@ -73,6 +73,12 @@ LLM_PROVIDERS = {
         "no_think_prefill": False,
         "key_env": "",
     },
+    "deepseek/deepseek-chat": {
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "model": "deepseek/deepseek-chat",
+        "no_think_prefill": False,
+        "key_env": "OPENROUTER_API_KEY",
+    },
     "openrouter/free": {
         "url": "https://openrouter.ai/api/v1/chat/completions",
         "model": "openrouter/free",
@@ -203,7 +209,11 @@ def expand_ocr_detections(ocr_cards: list[dict]) -> list[dict]:
         if isinstance(items, list) and items:
             for it in items:
                 it_text = (it.get("text") or "").strip()
+                if len(it_text) > 60:
+                    continue
                 for sub_t in split_clumped_card_text(it_text):
+                    if len(sub_t) > 60:
+                        continue
                     expanded.append({
                         "sec": c_sec,
                         "text": sub_t,
@@ -217,6 +227,8 @@ def expand_ocr_detections(ocr_cards: list[dict]) -> list[dict]:
             raw_t = (c.get("text") or "").strip()
             sub_lines = split_clumped_card_text(raw_t)
             for idx, sub_t in enumerate(sub_lines):
+                if len(sub_t) > 60:
+                    continue
                 expanded.append({
                     "sec": c_sec,
                     "text": sub_t,
@@ -488,18 +500,38 @@ def run_translation_pipeline():
     fixed_blocks = []
     seen_ids = set()
 
-    for b in raw_translated.split("\n\n"):
-        lines = [l.strip() for l in b.split("\n") if l.strip()]
-        lines = [l for l in lines if "-->" not in l]
-        if len(lines) < 2:
-            continue
-        cid = lines[0]
-        if cid not in orig_time_by_id or cid in seen_ids:
-            continue
-        seen_ids.add(cid)
+    # 以行導向狀態機嚴格解析：防止模型偷塞序號導致整批時間軸錯位
+    cue_lines_map: dict[str, list[str]] = {}
+    current_cue_id = None
 
-        dlg_trans = [l for l in lines[1:] if not l.startswith("【字卡】")]
-        raw_card_trans = [l for l in lines[1:] if l.startswith("【字卡】")]
+    for raw_l in raw_translated.splitlines():
+        l = raw_l.strip()
+        if not l or "-->" in l:
+            continue
+        # 匹配獨立序號行
+        if l.isdigit() and l in orig_time_by_id:
+            current_cue_id = l
+            if current_cue_id not in cue_lines_map:
+                cue_lines_map[current_cue_id] = []
+        elif current_cue_id:
+            cue_lines_map[current_cue_id].append(l)
+
+    for cid in [d['id'].strip() for d in dialogues]:
+        lines = cue_lines_map.get(cid, [])
+        if not lines:
+            # 若模型遺漏整句，回退保留原文
+            fallback_text = orig_text_by_id.get(cid, "")
+            fixed_blocks.append({
+                "id": cid,
+                "time": orig_time_by_id[cid],
+                "dlg_lines": [fallback_text],
+                "card_lines": [f"【字卡】{c}" for c in input_cards_by_id.get(cid, [])],
+            })
+            continue
+
+        seen_ids.add(cid)
+        dlg_trans = [l for l in lines if not l.startswith("【字卡】")]
+        raw_card_trans = [l for l in lines if l.startswith("【字卡】")]
 
         # 將可能被模型用 " / " 串在同一行的字卡拆分為獨立【字卡】行
         card_trans = []

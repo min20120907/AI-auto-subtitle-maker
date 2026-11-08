@@ -45,6 +45,7 @@ DEFAULT_STYLE = {
 
 AVAILABLE_LLM_MODELS = [
     {"id": "qwen3.8-27b-fastmtp", "name": "Qwen 3.8 27B FastMTP (本機 GPU 預設)"},
+    {"id": "deepseek/deepseek-chat", "name": "DeepSeek V4 (OpenRouter 高速)"},
     {"id": "gemini-4-argon-high", "name": "Gemini 4 Argon (High)"},
     {"id": "gemini-4-argon-medium", "name": "Gemini 4 Argon (Medium)"},
     {"id": "gemini-3.8-flash-high", "name": "Gemini 3.8 Flash (High)"},
@@ -180,6 +181,22 @@ def _find_card_xy(sec: float, ocr_cards: list) -> tuple[int, int]:
     info = _find_card_info(sec, ocr_cards)
     return info["x"], info["y"]
 
+def _find_free_offset(base: int, lo: int, hi: int, gap: int, collides, max_steps: int = 24) -> int:
+    """
+    以有限步數搜尋不碰撞的垂直位置：依序嘗試 base, base+gap, base-gap, base+2gap, base-2gap…（夾取於 [lo, hi]）。
+    保證必定終止；若所有候選位置皆碰撞，回傳原始 base（寧可重疊也不卡死整條流水線）。
+    """
+    tried = set()
+    for k in range(max_steps + 1):
+        for sign in ((1,) if k == 0 else (1, -1)):
+            cand = max(lo, min(hi, base + sign * k * gap))
+            if cand in tried:
+                continue
+            tried.add(cand)
+            if not collides(cand):
+                return cand
+    return max(lo, min(hi, base))
+
 def _match_cards_spatial(sec: float, cards: list[str], ocr_cards: list, card_size: int = 38) -> list[dict]:
     """
     將同一字幕條目下的多條字卡/側邊留言對應至各自的空間座標，並執行垂直防碰撞錯開，
@@ -207,12 +224,17 @@ def _match_cards_spatial(sec: float, cards: list[str], ocr_cards: list, card_siz
             item_obj["y_bot"] = int(c_info["y_bot"])
 
         # 若與同條目內已放置的字卡水平位置相近且垂直距離過近，自動垂直錯開
-        while any(abs(item_obj["x"] - p["x"]) < 420 and abs(item_obj["y"] - p["y"]) < min_gap for p in placed):
-            step = min_gap if item_obj["y"] <= 880 else -min_gap
-            item_obj["y"] = max(70, min(1010, item_obj["y"] + step))
-            if "y_top" in item_obj and "y_bot" in item_obj:
-                item_obj["y_top"] = max(50, min(990, item_obj["y_top"] + step))
-                item_obj["y_bot"] = max(70, min(1020, item_obj["y_bot"] + step))
+        # （有限步數搜尋，避免舊版 while 迴圈在畫面底部上下來回震盪造成無窮迴圈卡死流水線）
+        orig_y = item_obj["y"]
+        new_y = _find_free_offset(
+            orig_y, 70, 1010, min_gap,
+            lambda y: any(abs(item_obj["x"] - p["x"]) < 420 and abs(y - p["y"]) < min_gap for p in placed),
+        )
+        shift = new_y - orig_y
+        item_obj["y"] = new_y
+        if shift and "y_top" in item_obj and "y_bot" in item_obj:
+            item_obj["y_top"] = max(50, min(990, item_obj["y_top"] + shift))
+            item_obj["y_bot"] = max(70, min(1020, item_obj["y_bot"] + shift))
         placed.append(item_obj)
     return placed
 
@@ -292,8 +314,10 @@ def build_vtt_and_transcript(srt_path: Path):
                     pct_y = max(6, min(92, int(round(safe_vtt_y / 1080.0 * 100))))
                 else:
                     pct_y = max(8, min(88, int(round(max(60, c_obj["y"] - 45) / 1080.0 * 100))))
-                while any(abs(pct_y - prev_py) < 6 and abs(pct_x - prev_px) < 25 for prev_px, prev_py in used_pct_lines):
-                    pct_y = min(92, pct_y + 6) if pct_y <= 80 else max(6, pct_y - 6)
+                pct_y = _find_free_offset(
+                    pct_y, 6, 92, 6,
+                    lambda py: any(abs(py - prev_py) < 6 and abs(pct_x - prev_px) < 25 for prev_px, prev_py in used_pct_lines),
+                )
                 used_pct_lines.append((pct_x, pct_y))
                 cue_id = f"{lines[0]}-card" if c_idx == 0 else f"{lines[0]}-card-{c_idx + 1}"
                 vtt_lines.extend([
@@ -1172,6 +1196,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         <span class="text-purple-300 font-medium">🤖 翻譯模型：</span>
         <select id="llmModelSelect" onchange="applyCardStyle()" class="bg-gray-900 border border-gray-700 rounded px-1.5 py-0.5 text-xs text-gray-200">
           <option value="qwen3.8-27b-fastmtp">Qwen 3.8 27B FastMTP (本機 GPU 預設)</option>
+          <option value="deepseek/deepseek-chat">DeepSeek V4 (OpenRouter 高速)</option>
           <option value="gemini-4-argon-high">Gemini 4 Argon (High)</option>
           <option value="gemini-4-argon-medium">Gemini 4 Argon (Medium)</option>
           <option value="gemini-3.8-flash-high">Gemini 3.8 Flash (High)</option>
