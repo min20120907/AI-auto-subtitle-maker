@@ -1,9 +1,143 @@
-import os, json, urllib.request, time, re, difflib, opencc
+import os, json, urllib.request, urllib.error, time, re, difflib, opencc
+from pathlib import Path
 
 s2tw = opencc.OpenCC('s2twp')
 video_title = os.environ.get('VIDEO_TITLE', 'Gyuri Ch. 감규리 - 매끈매끈하다 매끈매끈한')
 src_langs = [x.strip() for x in os.environ.get('SRC_LANGS', 'ko').split(',') if x.strip()]
 tgt_langs = [x.strip() for x in os.environ.get('TGT_LANGS', 'zh-TW').split(',') if x.strip()] or ['zh-TW']
+llm_model_id = os.environ.get('LLM_MODEL', 'qwen3.8-27b-fastmtp').strip() or 'qwen3.8-27b-fastmtp'
+
+def _load_hermes_env_key(key_name: str) -> str:
+    val = os.environ.get(key_name, "").strip()
+    if val:
+        return val
+    env_path = Path.home() / ".hermes" / ".env"
+    if env_path.exists():
+        try:
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip() == key_name:
+                    return v.strip().strip('"').strip("'")
+        except Exception:
+            pass
+    return ""
+
+LLM_PROVIDERS = {
+    "qwen3.8-27b-fastmtp": {
+        "url": "http://127.0.0.1:8088/v1/chat/completions",
+        "model": "qwen3.8-27b-fastmtp",
+        "no_think_prefill": True,
+        "key_env": "",
+    },
+    "gemini-4-argon-high": {
+        "url": "http://127.0.0.1:8965/v1/chat/completions",
+        "model": "gemini-4-argon-high",
+        "no_think_prefill": False,
+        "key_env": "",
+    },
+    "gemini-4-argon-medium": {
+        "url": "http://127.0.0.1:8965/v1/chat/completions",
+        "model": "gemini-4-argon-medium",
+        "no_think_prefill": False,
+        "key_env": "",
+    },
+    "gemini-3.8-flash-high": {
+        "url": "http://127.0.0.1:8965/v1/chat/completions",
+        "model": "gemini-3.8-flash-high",
+        "no_think_prefill": False,
+        "key_env": "",
+    },
+    "claude-sonnet-5-5-high": {
+        "url": "http://127.0.0.1:8965/v1/chat/completions",
+        "model": "claude-sonnet-5-5-high",
+        "no_think_prefill": False,
+        "key_env": "",
+    },
+    "claude-opus-5-5-high": {
+        "url": "http://127.0.0.1:8965/v1/chat/completions",
+        "model": "claude-opus-5-5-high",
+        "no_think_prefill": False,
+        "key_env": "",
+    },
+    "openrouter/free": {
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "model": "openrouter/free",
+        "no_think_prefill": False,
+        "key_env": "OPENROUTER_API_KEY",
+    },
+    "gemma4:12b": {
+        "url": "http://127.0.0.1:18443/v1/chat/completions",
+        "model": "gemma4:12b",
+        "no_think_prefill": False,
+        "key_env": "",
+    },
+    "qwen3.6:35b-a3b": {
+        "url": "http://127.0.0.1:18443/v1/chat/completions",
+        "model": "qwen3.6:35b-a3b",
+        "no_think_prefill": False,
+        "key_env": "",
+    },
+}
+
+def call_llm_chat(messages: list[dict], temperature: float = 0.2, max_tokens: int = 3500, timeout: int = 180) -> str:
+    cfg = LLM_PROVIDERS.get(llm_model_id, LLM_PROVIDERS["qwen3.8-27b-fastmtp"])
+    custom_url = os.environ.get("LLM_BASE_URL", "").strip()
+    target_url = f"{custom_url.rstrip('/')}/chat/completions" if custom_url else cfg["url"]
+    target_model = cfg["model"] if llm_model_id in LLM_PROVIDERS else llm_model_id
+
+    req_msgs = list(messages)
+    if cfg.get("no_think_prefill"):
+        req_msgs.append({"role": "assistant", "content": "</think>\n"})
+
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "AI-Video-Subtitle-Station/2.0",
+    }
+    api_key = os.environ.get("LLM_API_KEY", "").strip() or (
+        _load_hermes_env_key(cfg["key_env"]) if cfg.get("key_env") else ""
+    )
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    payload = {
+        "model": target_model,
+        "messages": req_msgs,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
+    try:
+        req = urllib.request.Request(target_url, data=json.dumps(payload).encode("utf-8"), headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = json.loads(r.read().decode("utf-8"))
+            content = (body.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+    except Exception as e:
+        if target_url != LLM_PROVIDERS["qwen3.8-27b-fastmtp"]["url"]:
+            print(f"[LLM Warning] Primary model '{llm_model_id}' failed ({e}), falling back to local Qwen3.8-27B (:8088)...")
+            fb_msgs = list(messages) + [{"role": "assistant", "content": "</think>\n"}]
+            fb_payload = {
+                "model": "qwen3.8-27b-fastmtp",
+                "messages": fb_msgs,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+            req_fb = urllib.request.Request(
+                LLM_PROVIDERS["qwen3.8-27b-fastmtp"]["url"],
+                data=json.dumps(fb_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req_fb, timeout=timeout) as r_fb:
+                body_fb = json.loads(r_fb.read().decode("utf-8"))
+                content = (body_fb.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        else:
+            raise
+
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+    content = re.sub(r"^</think>\s*", "", content).strip()
+    return content
 LANG_NAMES = {
     'zh-TW': '繁體中文（台灣口吻）',
     'en': 'English',
@@ -132,25 +266,15 @@ stage1_prompt = f"""你是一位精通多國影視與 VTuber 文化的頂級字�
 只輸出分析與名詞表，不要輸出翻譯。
 """
 
-print("Stage 1: Extracting global context and glossary...")
-payload1 = {
-    "model": "qwen3.8-27b-fastmtp",
-    "messages": [
-        {"role": "user", "content": stage1_prompt},
-        {"role": "assistant", "content": "</think>\n"}
-    ],
-    "temperature": 0.2,
-    "max_tokens": 3500
-}
-
-req1 = urllib.request.Request("http://localhost:8088/v1/chat/completions",
-    data=json.dumps(payload1).encode(), headers={"Content-Type": "application/json"})
-with urllib.request.urlopen(req1, timeout=120) as r:
-    context_knowledge = json.loads(r.read())["choices"][0]["message"]["content"]
-    context_knowledge = re.sub(r"<think>.*?</think>", "", context_knowledge, flags=re.DOTALL)
-    context_knowledge = re.sub(r"^</think>\s*", "", context_knowledge).strip()
-    if use_s2tw:
-        context_knowledge = s2tw.convert(context_knowledge)
+print(f"Stage 1: Extracting global context and glossary using [{llm_model_id}]...")
+context_knowledge = call_llm_chat(
+    messages=[{"role": "user", "content": stage1_prompt}],
+    temperature=0.2,
+    max_tokens=3500,
+    timeout=120,
+)
+if use_s2tw:
+    context_knowledge = s2tw.convert(context_knowledge)
 
 print("\n=== Stage 1 Output (Global Context) ===")
 print(context_knowledge[:800] + "...\n")
@@ -159,7 +283,7 @@ with open("global_context.txt", "w", encoding="utf-8") as f:
     f.write(context_knowledge)
 
 # STAGE 2: 注入全局背景，逐段依上下文自然意譯
-print("Stage 2: Context-aware translation based on global knowledge...")
+print(f"Stage 2: Context-aware translation based on global knowledge using [{llm_model_id}]...")
 
 no_zh_warning = "" if "zh-TW" in llm_tgt_langs else f"（注意：目標語言為 {tgt_desc}，絕對禁止輸出中文！）"
 multi_lang_rule = (
@@ -206,23 +330,17 @@ for d in dialogues:
     merged_cues.append(f"{d['id']}\n{d['text']}{card_suffix}")
 
 def translate_chunk(chunk_text):
-    p = {
-        "model": "qwen3.8-27b-fastmtp",
-        "messages": [
+    res = call_llm_chat(
+        messages=[
             {"role": "system", "content": stage2_system},
             {"role": "user", "content": f"請將以下字幕翻譯為【{tgt_desc}】{no_zh_warning}。\n【重要指令】：凡有【字卡】之條目，必須保留【字卡】前綴並將其內容 100% 翻譯為【{tgt_desc}】，絕對不可遺漏，不可保留未翻譯的韓文/日文原文！\n\n{chunk_text}"},
-            {"role": "assistant", "content": "</think>\n"}
         ],
-        "temperature": 0.2, "max_tokens": 4096
-    }
-    req = urllib.request.Request("http://localhost:8088/v1/chat/completions",
-        data=json.dumps(p).encode(), headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=180) as resp:
-        res = json.loads(resp.read().decode())["choices"][0]["message"]["content"]
-        res = re.sub(r"<think>.*?</think>", "", res, flags=re.DOTALL)
-        res = re.sub(r"^</think>\s*", "", res).strip()
-        lines = [l for l in res.split("\n") if not l.strip().startswith("```")]
-        return "\n".join(lines).strip()
+        temperature=0.2,
+        max_tokens=4096,
+        timeout=180,
+    )
+    lines = [l for l in res.split("\n") if not l.strip().startswith("```")]
+    return "\n".join(lines).strip()
 
 translated_chunks = []
 for i in range(0, len(merged_cues), 70):
@@ -301,7 +419,7 @@ for blk in fixed_blocks:
             untranslated_cards.append((blk["id"], c_idx, c_line))
 
 if untranslated_cards:
-    print(f"Detected {len(untranslated_cards)} untranslated card lines. Running targeted Qwen repair pass...")
+    print(f"Detected {len(untranslated_cards)} untranslated card lines. Running targeted LLM repair pass [{llm_model_id}]...")
     repair_lines = "\n".join([f"{cid}: {c.replace('【字卡】', '').strip()}" for cid, _, c in untranslated_cards])
     repair_prompt = f"""你是一位頂級影視在地化專家。請將以下影片畫面中的字卡逐行翻譯為【{tgt_desc}】：
 注意：原字卡可能包含綜藝特效字帶來的 OCR 殘缺或錯字，請依語意校正並翻譯為自然流暢的【{tgt_desc}】。
@@ -313,43 +431,34 @@ if untranslated_cards:
 
 {repair_lines}"""
 
-    p_repair = {
-        "model": "qwen3.8-27b-fastmtp",
-        "messages": [
-            {"role": "user", "content": repair_prompt},
-            {"role": "assistant", "content": "</think>\n"}
-        ],
-        "temperature": 0.1, "max_tokens": 1500
-    }
     try:
-        req_rep = urllib.request.Request("http://localhost:8088/v1/chat/completions",
-            data=json.dumps(p_repair).encode(), headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req_rep, timeout=60) as resp:
-            rep_res = json.loads(resp.read().decode())["choices"][0]["message"]["content"]
-            rep_res = re.sub(r"<think>.*?</think>", "", rep_res, flags=re.DOTALL)
-            rep_res = re.sub(r"^</think>\s*", "", rep_res).strip()
-            
-            # 解析序號並替換
-            card_map = {}
-            for line in rep_res.split("\n"):
-                m = re.match(r'^(\d+)\s*[:：]\s*(【字卡】.*)', line.strip())
-                if m:
-                    card_map[m.group(1)] = m.group(2).strip()
-                else:
-                    m2 = re.match(r'^(\d+)\s*[:：]\s*(.*)', line.strip())
-                    if m2:
-                        cleaned = m2.group(2).strip()
-                        cleaned = re.sub(r'^(【字卡】)+', '', cleaned).strip()
-                        card_map[m2.group(1)] = f"【字卡】{cleaned}"
+        rep_res = call_llm_chat(
+            messages=[{"role": "user", "content": repair_prompt}],
+            temperature=0.1,
+            max_tokens=1500,
+            timeout=90,
+        )
+        # 解析序號並替換
+        card_map = {}
+        for line in rep_res.split("\n"):
+            m = re.match(r'^(\d+)\s*[:：]\s*(【字卡】.*)', line.strip())
+            if m:
+                card_map[m.group(1)] = m.group(2).strip()
+            else:
+                m2 = re.match(r'^(\d+)\s*[:：]\s*(.*)', line.strip())
+                if m2:
+                    cleaned = m2.group(2).strip()
+                    cleaned = re.sub(r'^(【字卡】)+', '', cleaned).strip()
+                    card_map[m2.group(1)] = f"【字卡】{cleaned}"
 
-            for blk in fixed_blocks:
-                cid = blk["id"]
-                if cid in card_map:
-                    new_c = card_map[cid]
-                    if use_s2tw:
-                        new_c = s2tw.convert(new_c)
-                    blk["card_lines"] = [new_c]
-            print(f"Successfully repaired {len(card_map)} untranslated cards with 100% target language!")
+        for blk in fixed_blocks:
+            cid = blk["id"]
+            if cid in card_map:
+                new_c = card_map[cid]
+                if use_s2tw:
+                    new_c = s2tw.convert(new_c)
+                blk["card_lines"] = [new_c]
+        print(f"Successfully repaired {len(card_map)} untranslated cards with 100% target language!")
     except Exception as e:
         print(f"Warning: Card repair pass encountered error: {e}")
 

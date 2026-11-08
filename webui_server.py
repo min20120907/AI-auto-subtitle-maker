@@ -39,7 +39,19 @@ DEFAULT_STYLE = {
     "card_color": "#00FFFF",
     "card_font": "Noto Sans CJK JP",
     "card_size": 38,
+    "llm_model": "qwen3.8-27b-fastmtp",
 }
+
+AVAILABLE_LLM_MODELS = [
+    {"id": "qwen3.8-27b-fastmtp", "name": "Qwen 3.8 27B FastMTP (本機 GPU 預設)"},
+    {"id": "gemini-4-argon-high", "name": "Gemini 4 Argon (High)"},
+    {"id": "gemini-4-argon-medium", "name": "Gemini 4 Argon (Medium)"},
+    {"id": "gemini-3.8-flash-high", "name": "Gemini 3.8 Flash (High)"},
+    {"id": "claude-sonnet-5-5-high", "name": "Claude Sonnet 5.5 (High)"},
+    {"id": "claude-opus-5-5-high", "name": "Claude Opus 5.5 (High)"},
+    {"id": "openrouter/free", "name": "OpenRouter Free (雲端免費模型)"},
+    {"id": "gemma4:12b", "name": "Gemma 4 12B (Ollama 本機)"},
+]
 
 def load_style() -> dict:
     if STYLE_FILE.exists():
@@ -81,7 +93,7 @@ def load_history() -> list:
 def save_history(items: list):
     HISTORY_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def snapshot_job(job_id: str, title: str, src_langs: list[str], tgt_langs: list[str], soft_subs: bool = False):
+def snapshot_job(job_id: str, title: str, src_langs: list[str], tgt_langs: list[str], soft_subs: bool = False, llm_model: str = "qwen3.8-27b-fastmtp"):
     jdir = JOBS_DIR / job_id
     jdir.mkdir(parents=True, exist_ok=True)
     for fname in ARTIFACT_FILES:
@@ -94,6 +106,7 @@ def snapshot_job(job_id: str, title: str, src_langs: list[str], tgt_langs: list[
         "src_langs": src_langs,
         "tgt_langs": tgt_langs,
         "soft_subs": soft_subs,
+        "llm_model": llm_model,
     })
     save_history(items)
     JOB_STATUS["active_id"] = job_id
@@ -331,8 +344,11 @@ def _enqueue_tasks(task_objs: list[dict]) -> int:
         BATCH_QUEUE["is_running"] = True
         return BATCH_QUEUE["total"]
 
+_CURRENT_TASK_LLM_MODEL: str | None = None
+
 def _queue_worker_loop():
     """Background worker processing unified queue (YouTube, uploaded files, playlists) sequentially"""
+    global _CURRENT_TASK_LLM_MODEL
     while True:
         task = None
         try:
@@ -355,6 +371,7 @@ def _queue_worker_loop():
             print(f"[Queue Worker] Processing {BATCH_QUEUE['current_index']}/{total} [{task.get('type')}]: {task.get('title')}")
 
             task_type = task.get("type", "youtube")
+            _CURRENT_TASK_LLM_MODEL = task.get("llm_model")
             if task_type == "youtube":
                 run_youtube_pipeline(task["url"], task["src_langs"], task["tgt_langs"])
             elif task_type == "file":
@@ -469,7 +486,7 @@ _cleanup_stale_uploads()
 # Start persistent queue worker thread
 threading.Thread(target=_queue_worker_loop, daemon=True).start()
 
-def run_youtube_pipeline(url: str, src_langs: list[str], tgt_langs: list[str]):
+def run_youtube_pipeline(url: str, src_langs: list[str], tgt_langs: list[str], llm_model: str | None = None):
     try:
         yt_dlp = str(Path(sys.executable).parent / "yt-dlp")
         JOB_STATUS.update({"state": "running", "step": "0/4 解析與下載 YouTube 影片 (yt-dlp)...", "title": url})
@@ -483,11 +500,11 @@ def run_youtube_pipeline(url: str, src_langs: list[str], tgt_langs: list[str]):
             "--merge-output-format", "mp4", "--force-overwrites", "-o", str(raw_dest), url
         ], cwd=BASE_DIR, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         ensure_h264(raw_dest)
-        run_pipeline(raw_dest, title, src_langs, tgt_langs)
+        run_pipeline(raw_dest, title, src_langs, tgt_langs, llm_model)
     except Exception as e:
         JOB_STATUS.update({"state": "error", "step": f"❌ YT 下載失敗: {e}"})
 
-def run_pipeline(raw_video: Path, title: str, src_langs: list[str] | None = None, tgt_langs: list[str] | None = None):
+def run_pipeline(raw_video: Path, title: str, src_langs: list[str] | None = None, tgt_langs: list[str] | None = None, llm_model: str | None = None):
     src_langs = src_langs or ["auto"]
     tgt_langs = tgt_langs or ["zh-TW"]
     try:
@@ -500,11 +517,13 @@ def run_pipeline(raw_video: Path, title: str, src_langs: list[str] | None = None
             src_langs = detect_multi_langs(raw_video, model)
 
         style_cfg = load_style()
+        chosen_llm = (llm_model or _CURRENT_TASK_LLM_MODEL or style_cfg.get("llm_model") or "qwen3.8-27b-fastmtp").strip()
         env = {
             **os.environ,
             "VIDEO_TITLE": title,
             "SRC_LANGS": ",".join(src_langs),
             "TGT_LANGS": ",".join(tgt_langs),
+            "LLM_MODEL": chosen_llm,
             "CARD_COLOR": style_cfg.get("card_color", "#00FFFF"),
             "CARD_FONT": style_cfg.get("card_font", "Noto Sans CJK JP"),
             "CARD_SIZE": str(style_cfg.get("card_size", 38)),
@@ -546,7 +565,7 @@ def run_pipeline(raw_video: Path, title: str, src_langs: list[str] | None = None
         if ocr_err:
             raise ocr_err[0]
 
-        JOB_STATUS["step"] = f"3/4 Qwen3.8-27B 全域情境去噪與多語翻譯 ({','.join(tgt_langs)})..."
+        JOB_STATUS["step"] = f"3/4 [{chosen_llm}] 全域情境去噪與多語翻譯 ({','.join(tgt_langs)})..."
         subprocess.run([sys.executable, "agentic_full_translate.py"], cwd=BASE_DIR, env=env, check=True)
         subprocess.run([sys.executable, "generate_context_ass.py"], cwd=BASE_DIR, env=env, check=True)
         build_vtt_and_transcript(BASE_DIR / "context_translated_zh.srt")
@@ -558,7 +577,7 @@ def run_pipeline(raw_video: Path, title: str, src_langs: list[str] | None = None
         ensure_h264(preview_tmp)
         preview_tmp.replace(BASE_DIR / "video_context_1080p.mp4")
         job_id = f"job_{int(time.time())}"
-        snapshot_job(job_id, title, src_langs, tgt_langs, soft_subs=True)
+        snapshot_job(job_id, title, src_langs, tgt_langs, soft_subs=True, llm_model=chosen_llm)
         JOB_STATUS.update({"state": "done", "step": "✅ 處理完成", "title": title, "active_id": job_id})
     except Exception as e:
         JOB_STATUS.update({"state": "error", "step": f"❌ 失敗: {e}"})
@@ -671,6 +690,14 @@ def download_burned():
 def get_style():
     return JSONResponse(load_style())
 
+@app.get("/api/models")
+def get_models():
+    cfg = load_style()
+    return JSONResponse({
+        "current": cfg.get("llm_model", "qwen3.8-27b-fastmtp"),
+        "models": AVAILABLE_LLM_MODELS,
+    })
+
 @app.post("/api/style")
 async def update_style(request: Request):
     body = await request.json()
@@ -684,6 +711,8 @@ async def update_style(request: Request):
             allowed["card_size"] = max(20, min(72, int(body["card_size"])))
         except Exception:
             pass
+    if "llm_model" in body and str(body["llm_model"]).strip():
+        allowed["llm_model"] = str(body["llm_model"]).strip()
     cfg = save_style(allowed)
     if JOB_STATUS.get("state") == "running":
         return JSONResponse({"ok": True, "style": cfg, "deferred": True})
@@ -874,6 +903,7 @@ async def submit_batch(request: Request):
         raise HTTPException(status_code=400, detail="請至少勾選一部影片")
     src_langs = body.get("src_langs") or ["auto"]
     tgt_langs = body.get("tgt_langs") or ["zh-TW"]
+    llm_model = (body.get("llm_model") or load_style().get("llm_model") or "qwen3.8-27b-fastmtp").strip()
 
     task_objs = []
     for it in items:
@@ -888,6 +918,7 @@ async def submit_batch(request: Request):
             "url": u,
             "src_langs": src_langs,
             "tgt_langs": tgt_langs,
+            "llm_model": llm_model,
             "status": "pending",
             "step": "排隊中",
             "job_id": None,
@@ -906,9 +937,11 @@ async def upload_video(
     file: UploadFile = File(...),
     src_langs: str = Form("auto"),
     tgt_langs: str = Form("zh-TW"),
+    llm_model: str = Form(""),
 ):
     s_list = [x.strip() for x in src_langs.split(",") if x.strip()] or ["auto"]
     t_list = [x.strip() for x in tgt_langs.split(",") if x.strip()] or ["zh-TW"]
+    chosen_llm = (llm_model.strip() or load_style().get("llm_model") or "qwen3.8-27b-fastmtp")
     safe_name = Path(file.filename or "uploaded.mp4").name
     uploads_dir = BASE_DIR / "uploads"
     uploads_dir.mkdir(parents=True, exist_ok=True)
@@ -927,6 +960,7 @@ async def upload_video(
         "file_path": str(dest_path),
         "src_langs": s_list,
         "tgt_langs": t_list,
+        "llm_model": chosen_llm,
         "status": "pending",
         "step": "排隊中",
         "job_id": None,
@@ -949,6 +983,7 @@ async def upload_youtube(request: Request):
         raise HTTPException(status_code=400, detail="請輸入有效的 http/https 影片連結")
     s_list = body.get("src_langs") or ["auto"]
     t_list = body.get("tgt_langs") or ["zh-TW"]
+    chosen_llm = (body.get("llm_model") or load_style().get("llm_model") or "qwen3.8-27b-fastmtp").strip()
 
     t_id = f"task_{uuid.uuid4().hex[:12]}"
     task_obj = {
@@ -958,6 +993,7 @@ async def upload_youtube(request: Request):
         "url": url,
         "src_langs": s_list,
         "tgt_langs": t_list,
+        "llm_model": chosen_llm,
         "status": "pending",
         "step": "排隊中",
         "job_id": None,
@@ -1068,6 +1104,18 @@ HTML_CONTENT = """<!DOCTYPE html>
       </div>
       <!-- Card Style Customization Control -->
       <div class="flex items-center gap-2 flex-wrap bg-gray-800/60 px-2.5 py-1 rounded-lg border border-gray-700/80">
+        <span class="text-purple-300 font-medium">🤖 翻譯模型：</span>
+        <select id="llmModelSelect" onchange="applyCardStyle()" class="bg-gray-900 border border-gray-700 rounded px-1.5 py-0.5 text-xs text-gray-200">
+          <option value="qwen3.8-27b-fastmtp">Qwen 3.8 27B FastMTP (本機 GPU 預設)</option>
+          <option value="gemini-4-argon-high">Gemini 4 Argon (High)</option>
+          <option value="gemini-4-argon-medium">Gemini 4 Argon (Medium)</option>
+          <option value="gemini-3.8-flash-high">Gemini 3.8 Flash (High)</option>
+          <option value="claude-sonnet-5-5-high">Claude Sonnet 5.5 (High)</option>
+          <option value="claude-opus-5-5-high">Claude Opus 5.5 (High)</option>
+          <option value="openrouter/free">OpenRouter Free (雲端免費模型)</option>
+          <option value="gemma4:12b">Gemma 4 12B (Ollama 本機)</option>
+        </select>
+        <span class="text-gray-600">|</span>
         <span class="text-cyan-300 font-medium">🎨 字卡外觀：</span>
         <label class="inline-flex items-center gap-1">
           <span class="text-gray-400">顏色</span>
@@ -1143,7 +1191,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     </div>
 
     <!-- Right: Synchronized Transcript Sidebar -->
-    <div class="lg:col-span-4 bg-gray-900 border border-gray-800 rounded-2xl flex flex-col h-[calc(100vh-140px)] sticky top-24 overflow-hidden">
+    <div class="lg:col-span-4 bg-gray-900 border border-gray-800 rounded-2xl flex flex-col max-h-[60vh] lg:max-h-none lg:h-[calc(100vh-140px)] lg:sticky lg:top-24 overflow-hidden">
       <div class="p-4 border-b border-gray-800 flex items-center justify-between">
         <div>
           <h2 class="font-bold text-sm text-gray-200">即時同步字幕與字卡</h2>
@@ -1155,7 +1203,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       </div>
 
       <!-- Transcript Item List -->
-      <div id="transcriptList" class="flex-1 overflow-y-auto p-3 space-y-2 text-sm divide-y divide-gray-800/40">
+      <div id="transcriptList" class="relative flex-1 overflow-y-auto overscroll-contain p-3 space-y-2 text-sm divide-y divide-gray-800/40">
         <div class="text-center py-10 text-gray-500 text-xs">載入字幕中...</div>
       </div>
     </div>
@@ -1237,6 +1285,10 @@ HTML_CONTENT = """<!DOCTYPE html>
         document.getElementById('cardColorInput').value = currentStyle.card_color || '#00FFFF';
         document.getElementById('cardFontSelect').value = currentStyle.card_font || 'Noto Sans CJK JP';
         document.getElementById('cardSizeInput').value = currentStyle.card_size || 38;
+        const modelSel = document.getElementById('llmModelSelect');
+        if (modelSel && currentStyle.llm_model) {
+          modelSel.value = currentStyle.llm_model;
+        }
         injectCueStyle();
       }
     }
@@ -1256,10 +1308,12 @@ HTML_CONTENT = """<!DOCTYPE html>
       const card_color = document.getElementById('cardColorInput').value;
       const card_font = document.getElementById('cardFontSelect').value;
       const card_size = parseInt(document.getElementById('cardSizeInput').value || '38', 10);
+      const modelSel = document.getElementById('llmModelSelect');
+      const llm_model = modelSel ? modelSel.value : 'qwen3.8-27b-fastmtp';
       const res = await fetch('/api/style', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ card_color, card_font, card_size })
+        body: JSON.stringify({ card_color, card_font, card_size, llm_model })
       });
       if (res.ok) {
         const data = await res.json();
@@ -1378,6 +1432,8 @@ HTML_CONTENT = """<!DOCTYPE html>
       video.play();
     }
 
+    let lastActiveCueIdx = -1;
+
     video.addEventListener('timeupdate', () => {
       const cur = video.currentTime;
       let activeIdx = -1;
@@ -1390,22 +1446,30 @@ HTML_CONTENT = """<!DOCTYPE html>
         }
       }
 
-      document.querySelectorAll('.cue-item').forEach(el => el.classList.remove('active-cue'));
-      if (activeIdx !== -1) {
-        const el = document.getElementById(`cue-${activeIdx}`);
-        if (el) {
-          el.classList.add('active-cue');
-          // 僅滾動字幕容器 transcriptList 內部，防止手機版觸發 window/viewport 滾動將影片推移
-          const container = document.getElementById('transcriptList');
-          if (container) {
-            const elTop = el.offsetTop - container.offsetTop;
-            const elBottom = elTop + el.offsetHeight;
-            const viewTop = container.scrollTop;
-            const viewBottom = viewTop + container.clientHeight;
-            if (elTop < viewTop) {
-              container.scrollTo({ top: elTop - 12, behavior: 'smooth' });
-            } else if (elBottom > viewBottom) {
-              container.scrollTo({ top: elBottom - container.clientHeight + 12, behavior: 'smooth' });
+      if (activeIdx !== lastActiveCueIdx) {
+        lastActiveCueIdx = activeIdx;
+        document.querySelectorAll('.cue-item').forEach(el => el.classList.remove('active-cue'));
+        if (activeIdx !== -1) {
+          const el = document.getElementById(`cue-${activeIdx}`);
+          if (el) {
+            el.classList.add('active-cue');
+            // 僅在桌機雙欄模式 (lg: 1024px+) 時同步捲動右側字幕欄，並強制鎖定 window.scrollY
+            // 徹底避免 iPad / 手機 WebKit 因捲動字幕欄而把頁面往下拉動、滑走影片視窗
+            const container = document.getElementById('transcriptList');
+            const isSideBySide = window.innerWidth >= 1024;
+            if (container && isSideBySide) {
+              const savedWinX = window.scrollX;
+              const savedWinY = window.scrollY;
+              const cRect = container.getBoundingClientRect();
+              const eRect = el.getBoundingClientRect();
+              if (eRect.top < cRect.top) {
+                container.scrollTop += (eRect.top - cRect.top) - 12;
+              } else if (eRect.bottom > cRect.bottom) {
+                container.scrollTop += (eRect.bottom - cRect.bottom) + 12;
+              }
+              if (window.scrollY !== savedWinY || window.scrollX !== savedWinX) {
+                window.scrollTo(savedWinX, savedWinY);
+              }
             }
           }
         }
@@ -1537,6 +1601,7 @@ HTML_CONTENT = """<!DOCTYPE html>
               <span>🕒 ${it.created_at || ''}</span>
               <span>🎙️ 來源: ${(it.src_langs || ['ko']).join(', ')}</span>
               <span>💬 字幕: ${(it.tgt_langs || ['zh-TW']).join(', ')}</span>
+              ${it.llm_model ? `<span class="text-purple-300">🤖 ${it.llm_model}</span>` : ''}
             </div>
           </div>
           <div class="flex items-center gap-2 shrink-0">
@@ -1600,13 +1665,15 @@ HTML_CONTENT = """<!DOCTYPE html>
       if (!url) return;
       const src_langs = getSelectedLangs('srcLang', ['auto']);
       const tgt_langs = getSelectedLangs('tgtLang', ['zh-TW']);
+      const modelSel = document.getElementById('llmModelSelect');
+      const llm_model = modelSel ? modelSel.value : 'qwen3.8-27b-fastmtp';
       const badge = document.getElementById('jobBadge');
       badge.classList.remove('hidden');
       badge.innerText = '⏳ 送出 YouTube 連結...';
       const res = await fetch('/api/youtube', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, src_langs, tgt_langs })
+        body: JSON.stringify({ url, src_langs, tgt_langs, llm_model })
       });
       const data = await res.json();
       if (!res.ok) {
@@ -1625,6 +1692,8 @@ HTML_CONTENT = """<!DOCTYPE html>
       if (!file) return;
       const src_langs = getSelectedLangs('srcLang', ['auto']);
       const tgt_langs = getSelectedLangs('tgtLang', ['zh-TW']);
+      const modelSel = document.getElementById('llmModelSelect');
+      const llm_model = modelSel ? modelSel.value : 'qwen3.8-27b-fastmtp';
       const badge = document.getElementById('jobBadge');
       badge.classList.remove('hidden');
       badge.innerText = `⏫ 上傳中 (${(file.size/1048576).toFixed(1)} MB)...`;
@@ -1632,6 +1701,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       fd.append('file', file);
       fd.append('src_langs', src_langs.join(','));
       fd.append('tgt_langs', tgt_langs.join(','));
+      fd.append('llm_model', llm_model);
       const res = await fetch('/api/upload', { method: 'POST', body: fd });
       const data = await res.json();
       if (!res.ok) {
@@ -1751,6 +1821,8 @@ HTML_CONTENT = """<!DOCTYPE html>
       if (!selected.length) return;
       const src_langs = getSelectedLangs('srcLang', ['auto']);
       const tgt_langs = getSelectedLangs('tgtLang', ['zh-TW']);
+      const modelSel = document.getElementById('llmModelSelect');
+      const llm_model = modelSel ? modelSel.value : 'qwen3.8-27b-fastmtp';
       const submitBtn = document.getElementById('btnSubmitBatch');
       submitBtn.disabled = true;
       submitBtn.innerText = '⏳ 提交排隊中...';
@@ -1759,7 +1831,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         const res = await fetch('/api/batch/submit', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ items: selected, src_langs, tgt_langs })
+          body: JSON.stringify({ items: selected, src_langs, tgt_langs, llm_model })
         });
         const data = await res.json();
         if (res.ok) {
@@ -1905,7 +1977,14 @@ HTML_CONTENT = """<!DOCTYPE html>
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return HTML_CONTENT
+    return HTMLResponse(
+        content=HTML_CONTENT,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 if __name__ == "__main__":
     uvicorn.run("webui_server:app", host="0.0.0.0", port=8501, reload=True)

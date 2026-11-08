@@ -156,8 +156,9 @@ python3 webui_server.py
 | `GET` | `/api/status` | 查詢目前單片流水線執行進度狀態與軟字幕標記 |
 | `GET` | `/api/queue` | 查詢統一排隊佇列整體進度與各影片項目詳細狀態 |
 | `POST` | `/api/queue/clear` | 清空待處理排隊佇列（只移除待處理項目，正在處理中的影片會繼續跑完） |
-| `GET` | `/api/style` | 取得字卡顏色、字型與字級設定 |
-| `POST` | `/api/style` | 即時更新字卡樣式並自動刷新預覽 VTT 與 ASS（若影片處理中則保存設定但延後重繪，回應 `deferred: true`） |
+| `GET` | `/api/models` | 列出支援切換的多模型清單（Qwen 3.8 27B、Gemini 4 Argon、Gemini 3.8 Flash、Claude 5.5 等）與目前選定模型 |
+| `GET` | `/api/style` | 取得字卡顏色、字型、字級與預設 LLM 模型設定 |
+| `POST` | `/api/style` | 即時更新字卡樣式與 LLM 模型設定，並自動刷新預覽 VTT 與 ASS（若影片處理中則保存設定但延後重繪，回應 `deferred: true`） |
 | `POST` | `/api/burn` | 背景觸發 FFmpeg ASS 燒錄，產出高畫質硬字幕 MP4 |
 | `GET` | `/api/burn/status` | 查詢硬字幕壓製進度與狀態 |
 | `GET` | `/download/burned` | 下載壓製完成之硬字幕 MP4 影片檔 |
