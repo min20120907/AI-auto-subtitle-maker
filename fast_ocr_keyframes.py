@@ -44,15 +44,26 @@ def ocr_worker(batch):
                     x1, y1 = bbox[2]
                     real_x = int(((x0 + x1) / 2.0) * (1920.0 / max(1, w)))
                     real_y = int((y_offset + (y0 + y1) / 2.0) * (1080.0 / max(1, h)))
+                    norm_top = int((y_offset + min(y0, y1)) * (1080.0 / max(1, h)))
+                    norm_bot = int((y_offset + max(y0, y1)) * (1080.0 / max(1, h)))
                     real_x = max(120, min(1800, real_x))
                     real_y = max(80, min(1020, real_y))
-                    seen_texts[raw_txt] = (real_x, real_y)
+                    seen_texts[raw_txt] = (real_x, real_y, norm_top, norm_bot)
         if seen_texts:
             # 若同一畫面有多個字卡區塊，合併文字並取平均或主字卡座標
             combined_text = ' '.join(seen_texts.keys())
             avg_x = int(np.mean([pos[0] for pos in seen_texts.values()]))
             avg_y = int(np.mean([pos[1] for pos in seen_texts.values()]))
-            results.append({"sec": sec, "text": combined_text, "x": avg_x, "y": avg_y})
+            min_top = int(min([pos[2] for pos in seen_texts.values()]))
+            max_bot = int(max([pos[3] for pos in seen_texts.values()]))
+            results.append({
+                "sec": sec,
+                "text": combined_text,
+                "x": avg_x,
+                "y": avg_y,
+                "y_top": min_top,
+                "y_bot": max_bot,
+            })
     return results
 
 def main():

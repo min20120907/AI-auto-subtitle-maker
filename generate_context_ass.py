@@ -63,15 +63,26 @@ if os.path.exists('ocr_detections.json'):
     except Exception:
         ocr_cards = []
 
-def find_card_pos(sec: float) -> tuple[int, int]:
+def find_card_pos(sec: float) -> tuple[int, int, bool]:
     best_x, best_y, best_dist = 960, 820, 999.0
+    matched = None
     for c in ocr_cards:
         d = abs(float(c.get('sec', 0.0)) - sec)
         if d < best_dist and d <= 4.0:
             best_dist = d
             best_x = int(c.get('x', 960))
             best_y = int(c.get('y', 820))
-    return best_x, best_y
+            matched = c
+    if matched and 'y_top' in matched and 'y_bot' in matched:
+        y_top = int(matched['y_top'])
+        y_bot = int(matched['y_bot'])
+        # 避免擋住原文字卡：若上方空間足夠則置於原字卡上方，否則置於下方
+        if y_top >= 130:
+            clear_y = max(65, y_top - 20)
+        else:
+            clear_y = min(1015, y_bot + 45)
+        return best_x, clear_y, True
+    return best_x, best_y, False
 
 with open('context_translated_zh.srt', 'r', encoding='utf-8') as f:
     text = f.read().strip()
@@ -99,7 +110,7 @@ for b in blocks:
             ]
             srt_lines = dlg_lines + [f"【字卡】{c}" for c in kept_cards]
             if srt_lines:
-                cx, cy = find_card_pos(t0) if kept_cards else (960, 820)
+                cx, cy, has_clear = find_card_pos(t0) if kept_cards else (960, 820, False)
                 cues.append({
                     'start': t0,
                     'end': t1,
@@ -107,6 +118,7 @@ for b in blocks:
                     'card_lines': kept_cards,
                     'x': cx,
                     'y': cy,
+                    'has_clear': has_clear,
                 })
                 rewritten_srt.append('\n'.join([cid, lines[1]] + srt_lines))
 
@@ -159,7 +171,10 @@ for c in cues:
         card_text = "\\N".join([l for l in safe_cards if l])
         if card_text:
             pos_x = max(120, min(1800, int(c['x'])))
-            pos_y = max(65, min(1020, int(c['y']) - 45))
+            if c.get('has_clear'):
+                pos_y = max(65, min(1020, int(c['y'])))
+            else:
+                pos_y = max(65, min(1020, int(c['y']) - 45))
             events.append(
                 f"Dialogue: 1,{to_ass_time(c['start'])},{to_ass_time(c['end'])},CardFloat,,0,0,0,,{{\\pos({pos_x},{pos_y})}}{card_text}"
             )

@@ -114,15 +114,28 @@ def _parse_ts(ts: str) -> float:
     s, ms = s_ms.replace(".", ",").split(",")
     return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
 
-def _find_card_xy(sec: float, ocr_cards: list) -> tuple[int, int]:
-    best_x, best_y, best_dist = 960, 820, 999.0
+def _find_card_info(sec: float, ocr_cards: list) -> dict:
+    best_dist = 999.0
+    matched = None
     for c in ocr_cards:
         d = abs(float(c.get("sec", 0.0)) - sec)
         if d < best_dist and d <= 4.0:
             best_dist = d
-            best_x = int(c.get("x", 960))
-            best_y = int(c.get("y", 820))
-    return best_x, best_y
+            matched = c
+    if matched:
+        res = {
+            "x": int(matched.get("x", 960)),
+            "y": int(matched.get("y", 820)),
+        }
+        if "y_top" in matched and "y_bot" in matched:
+            res["y_top"] = int(matched["y_top"])
+            res["y_bot"] = int(matched["y_bot"])
+        return res
+    return {"x": 960, "y": 820}
+
+def _find_card_xy(sec: float, ocr_cards: list) -> tuple[int, int]:
+    info = _find_card_info(sec, ocr_cards)
+    return info["x"], info["y"]
 
 def build_vtt_and_transcript(srt_path: Path):
     style_cfg = load_style()
@@ -163,9 +176,10 @@ def build_vtt_and_transcript(srt_path: Path):
             else:
                 dlg.append(l)
         card_str = " / ".join(cards) if cards else None
-        cx, cy = _find_card_xy(t0, ocr_cards) if card_str else (960, 820)
+        c_info = _find_card_info(t0, ocr_cards) if card_str else {"x": 960, "y": 820}
+        cx, cy = c_info["x"], c_info["y"]
         dialogue_str = "\n".join(dlg) if dlg else (card_str or "")
-        transcript.append({
+        tr_item = {
             "id": lines[0],
             "start": round(t0, 3),
             "end": round(t1, 3),
@@ -174,13 +188,24 @@ def build_vtt_and_transcript(srt_path: Path):
             "card": card_str,
             "card_x": cx,
             "card_y": cy,
-        })
+        }
+        if "y_top" in c_info and "y_bot" in c_info:
+            tr_item["card_y_top"] = c_info["y_top"]
+            tr_item["card_y_bot"] = c_info["y_bot"]
+        transcript.append(tr_item)
         vtt_ts = lines[1].replace(",", ".")
         if dlg:
             vtt_lines.extend([lines[0], vtt_ts, "\n".join(dlg), ""])
         if card_str:
             pct_x = max(10, min(90, int(round(cx / 1920.0 * 100))))
-            pct_y = max(8, min(88, int(round(max(60, cy - 45) / 1080.0 * 100))))
+            if "y_top" in c_info and "y_bot" in c_info:
+                if c_info["y_top"] >= 140:
+                    safe_vtt_y = max(60, c_info["y_top"] - 30)
+                else:
+                    safe_vtt_y = min(1010, c_info["y_bot"] + 45)
+                pct_y = max(6, min(92, int(round(safe_vtt_y / 1080.0 * 100))))
+            else:
+                pct_y = max(8, min(88, int(round(max(60, cy - 45) / 1080.0 * 100))))
             vtt_lines.extend([
                 f"{lines[0]}-card",
                 f"{vtt_ts} line:{pct_y}% position:{pct_x}% align:center",
@@ -709,8 +734,8 @@ HTML_CONTENT = """<!DOCTYPE html>
           <div id="dialogueBox" class="absolute bottom-6 left-1/2 -translate-x-1/2 text-center px-4 py-1.5 rounded-lg max-w-[90%] transition-opacity duration-150" style="display: none; background: rgba(0,0,0,0.65); text-shadow: 0 1px 3px rgba(0,0,0,0.9);">
             <div id="dialogueText" class="text-white font-medium text-base sm:text-lg leading-snug whitespace-pre-line"></div>
           </div>
-          <!-- Floating card (positioned at card_x, card_y) -->
-          <div id="cardBox" class="absolute -translate-x-1/2 -translate-y-1/2 px-3 py-1 rounded bg-black/60 shadow-lg border border-gray-800/60 font-semibold transition-all duration-150" style="display: none;"></div>
+          <!-- Floating card (positioned at card_x, card_y with bounding clamp and non-blocking clearance) -->
+          <div id="cardBox" class="absolute -translate-x-1/2 -translate-y-1/2 px-3 py-1 rounded bg-black/75 shadow-xl border border-cyan-500/40 font-semibold transition-all duration-150 pointer-events-none" style="display: none; max-width: 90%; box-sizing: border-box; word-break: break-word; text-align: center;"></div>
         </div>
       </div>
 
@@ -957,19 +982,50 @@ HTML_CONTENT = """<!DOCTYPE html>
           dlgBox.style.display = 'none';
         }
 
-        // 2. Floating Card
+        // 2. Floating Card: 嚴格邊界夾取（防止超出影片）與防遮擋原始字卡淨空
         if (hasCard && cardBox) {
           cardBox.innerText = activeCue.card;
-          const pctX = activeCue.card_x ? Math.max(10, Math.min(90, (activeCue.card_x / 1920.0) * 100)) : 50;
-          const pctY = activeCue.card_y ? Math.max(8, Math.min(88, (Math.max(60, activeCue.card_y - 45) / 1080.0) * 100)) : 75;
-          cardBox.style.left = `${pctX}%`;
-          cardBox.style.top = `${pctY}%`;
           cardBox.style.color = currentStyle.card_color || '#00FFFF';
           cardBox.style.fontFamily = `"${currentStyle.card_font || 'Noto Sans CJK JP'}", sans-serif`;
           const baseSize = currentStyle.card_size || 38;
-          const scaledSize = Math.max(14, Math.min(48, Math.round(baseSize * ((overlay ? overlay.clientHeight : 1080) / 1080.0))));
+          const overlayW = overlay ? overlay.clientWidth : 1920;
+          const overlayH = overlay ? overlay.clientHeight : 1080;
+          const scaledSize = Math.max(13, Math.min(44, Math.round(baseSize * (overlayH / 1080.0))));
           cardBox.style.fontSize = `${scaledSize}px`;
+          cardBox.style.maxWidth = `${Math.round(overlayW * 0.90)}px`;
           cardBox.style.display = 'block';
+
+          // 計算卡片本體尺寸以實施幾何邊界保護
+          const cardW = cardBox.offsetWidth || 120;
+          const cardH = cardBox.offsetHeight || 28;
+          const halfW = cardW / 2;
+          const halfH = cardH / 2;
+
+          // X 座標：依 1920 比例映射，並嚴格夾取於可視區域內 (左右各留 8px 邊界)
+          const targetX = activeCue.card_x ? (activeCue.card_x / 1920.0) * overlayW : overlayW / 2;
+          const clampedX = Math.max(halfW + 8, Math.min(overlayW - halfW - 8, targetX));
+          cardBox.style.left = `${Math.round(clampedX)}px`;
+
+          // Y 座標：若具備字卡上下界 (card_y_top/bot)，確保譯文置於原字卡本體外；否則上浮避讓
+          let targetY;
+          if (activeCue.card_y_top !== undefined && activeCue.card_y_bot !== undefined) {
+            const origTop = (activeCue.card_y_top / 1080.0) * overlayH;
+            const origBot = (activeCue.card_y_bot / 1080.0) * overlayH;
+            if (origTop >= cardH + 14) {
+              targetY = origTop - halfH - 6; // 置於原文字卡上方外側，完全不遮擋原文
+            } else if (overlayH - origBot >= cardH + 14) {
+              targetY = origBot + halfH + 6; // 置於原文字卡下方外側
+            } else {
+              targetY = origTop - halfH - 2;
+            }
+          } else {
+            const rawY = activeCue.card_y ? (activeCue.card_y / 1080.0) * overlayH : overlayH * 0.75;
+            targetY = rawY - cardH - 10;
+          }
+          // 上下邊界嚴格夾取 (上下各留 8px 邊界)
+          const clampedY = Math.max(halfH + 8, Math.min(overlayH - halfH - 8, targetY));
+          cardBox.style.top = `${Math.round(clampedY)}px`;
+          cardBox.style.transform = 'translate(-50%, -50%)';
         } else if (cardBox) {
           cardBox.style.display = 'none';
         }
