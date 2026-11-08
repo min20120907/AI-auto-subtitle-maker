@@ -687,7 +687,7 @@ def activate_history(job_id: str):
             _link_or_copy(jdir / fname, BASE_DIR / fname)
     if (BASE_DIR / "video_context_1080p.mp4").exists():
         ensure_h264(BASE_DIR / "video_context_1080p.mp4")
-    JOB_STATUS.update({"title": target["title"], "active_id": job_id})
+    JOB_STATUS.update({"state": "done", "step": "✅ 處理完成", "title": target["title"], "active_id": job_id})
     return JSONResponse({"ok": True, "active_id": job_id, "title": target["title"]})
 
 @app.delete("/api/history/{job_id}")
