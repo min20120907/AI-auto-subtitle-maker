@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os, sys, json, re, time, shutil, subprocess, threading, queue, uuid
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
@@ -139,6 +140,21 @@ def _parse_ts(ts: str) -> float:
     s, ms = s_ms.replace(".", ",").split(",")
     return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
 
+def _split_clumped_cards(raw_cards: list[str]) -> list[str]:
+    """將可能串接在同一行的多則 VTuber 側邊留言或字卡拆分為獨立項目。"""
+    out = []
+    for rc in raw_cards:
+        txt = rc.replace("【字卡】", "").strip()
+        if not txt:
+            continue
+        txt = re.sub(r"\s+/\s+", "\n", txt)
+        txt = re.sub(r"(?<!^)\s+(?=(?:>>|💬|@[A-Za-z0-9_.\-]{2,}\s*[:：]))", "\n", txt)
+        for sub in txt.splitlines():
+            s = sub.strip()
+            if s and s not in out:
+                out.append(s)
+    return out
+
 def _find_card_info(sec: float, ocr_cards: list) -> dict:
     best_dist = 999.0
     matched = None
@@ -155,6 +171,8 @@ def _find_card_info(sec: float, ocr_cards: list) -> dict:
         if "y_top" in matched and "y_bot" in matched:
             res["y_top"] = int(matched["y_top"])
             res["y_bot"] = int(matched["y_bot"])
+        if isinstance(matched.get("items"), list) and matched["items"]:
+            res["items"] = matched["items"]
         return res
     return {"x": 960, "y": 820}
 
@@ -162,10 +180,47 @@ def _find_card_xy(sec: float, ocr_cards: list) -> tuple[int, int]:
     info = _find_card_info(sec, ocr_cards)
     return info["x"], info["y"]
 
+def _match_cards_spatial(sec: float, cards: list[str], ocr_cards: list, card_size: int = 38) -> list[dict]:
+    """
+    將同一字幕條目下的多條字卡/側邊留言對應至各自的空間座標，並執行垂直防碰撞錯開，
+    防止多則側邊留言擠在同一座標或互相重疊。
+    """
+    c_info = _find_card_info(sec, ocr_cards)
+    spatial_items = c_info.get("items") if isinstance(c_info.get("items"), list) and c_info.get("items") else [c_info]
+    min_gap = max(46, int(card_size) + 12)
+    placed = []
+    for idx, c_text in enumerate(cards):
+        sp = spatial_items[idx] if idx < len(spatial_items) else spatial_items[-1]
+        cx = int(sp.get("x", c_info.get("x", 960)))
+        cy = int(sp.get("y", c_info.get("y", 820)))
+        item_obj = {
+            "text": c_text,
+            "x": cx,
+            "y": cy,
+            "is_side_comment": bool(sp.get("is_side_comment", cx < 460 or cx > 1460)),
+        }
+        if "y_top" in sp and "y_bot" in sp:
+            item_obj["y_top"] = int(sp["y_top"])
+            item_obj["y_bot"] = int(sp["y_bot"])
+        elif idx == 0 and "y_top" in c_info and "y_bot" in c_info:
+            item_obj["y_top"] = int(c_info["y_top"])
+            item_obj["y_bot"] = int(c_info["y_bot"])
+
+        # 若與同條目內已放置的字卡水平位置相近且垂直距離過近，自動垂直錯開
+        while any(abs(item_obj["x"] - p["x"]) < 420 and abs(item_obj["y"] - p["y"]) < min_gap for p in placed):
+            step = min_gap if item_obj["y"] <= 880 else -min_gap
+            item_obj["y"] = max(70, min(1010, item_obj["y"] + step))
+            if "y_top" in item_obj and "y_bot" in item_obj:
+                item_obj["y_top"] = max(50, min(990, item_obj["y_top"] + step))
+                item_obj["y_bot"] = max(70, min(1020, item_obj["y_bot"] + step))
+        placed.append(item_obj)
+    return placed
+
 def build_vtt_and_transcript(srt_path: Path):
     style_cfg = load_style()
     card_color = style_cfg.get("card_color", "#00FFFF")
     card_font = style_cfg.get("card_font", "Noto Sans CJK JP")
+    card_size = int(style_cfg.get("card_size", 38))
     ocr_cards = []
     ocr_path = BASE_DIR / "ocr_detections.json"
     if ocr_path.exists():
@@ -192,17 +247,20 @@ def build_vtt_and_transcript(srt_path: Path):
         if not m:
             continue
         t0, t1 = _parse_ts(m.group(1)), _parse_ts(m.group(2))
-        dlg, cards = [], []
+        dlg, raw_cards = [], []
         for l in lines[2:]:
             if l.startswith("【字卡】"):
                 cleaned = l.replace("【字卡】", "", 1).strip()
                 if cleaned:
-                    cards.append(cleaned)
+                    raw_cards.append(cleaned)
             else:
                 dlg.append(l)
-        card_str = " / ".join(cards) if cards else None
+        cards = _split_clumped_cards(raw_cards)
+        card_str = "\n".join(cards) if cards else None
         c_info = _find_card_info(t0, ocr_cards) if card_str else {"x": 960, "y": 820}
-        cx, cy = c_info["x"], c_info["y"]
+        card_objs = _match_cards_spatial(t0, cards, ocr_cards, card_size=card_size) if cards else []
+        cx = card_objs[0]["x"] if card_objs else c_info["x"]
+        cy = card_objs[0]["y"] if card_objs else c_info["y"]
         dialogue_str = "\n".join(dlg) if dlg else (card_str or "")
         tr_item = {
             "id": lines[0],
@@ -211,6 +269,7 @@ def build_vtt_and_transcript(srt_path: Path):
             "time": lines[1],
             "dialogue": dialogue_str,
             "card": card_str,
+            "cards": card_objs,
             "card_x": cx,
             "card_y": cy,
         }
@@ -221,22 +280,28 @@ def build_vtt_and_transcript(srt_path: Path):
         vtt_ts = lines[1].replace(",", ".")
         if dlg:
             vtt_lines.extend([lines[0], vtt_ts, "\n".join(dlg), ""])
-        if card_str:
-            pct_x = max(10, min(90, int(round(cx / 1920.0 * 100))))
-            if "y_top" in c_info and "y_bot" in c_info:
-                if c_info["y_top"] >= 140:
-                    safe_vtt_y = max(60, c_info["y_top"] - 30)
+        if card_objs:
+            used_pct_lines = []
+            for c_idx, c_obj in enumerate(card_objs):
+                pct_x = max(10, min(90, int(round(c_obj["x"] / 1920.0 * 100))))
+                if "y_top" in c_obj and "y_bot" in c_obj:
+                    if c_obj["y_top"] >= 140:
+                        safe_vtt_y = max(60, c_obj["y_top"] - 30)
+                    else:
+                        safe_vtt_y = min(1010, c_obj["y_bot"] + 45)
+                    pct_y = max(6, min(92, int(round(safe_vtt_y / 1080.0 * 100))))
                 else:
-                    safe_vtt_y = min(1010, c_info["y_bot"] + 45)
-                pct_y = max(6, min(92, int(round(safe_vtt_y / 1080.0 * 100))))
-            else:
-                pct_y = max(8, min(88, int(round(max(60, cy - 45) / 1080.0 * 100))))
-            vtt_lines.extend([
-                f"{lines[0]}-card",
-                f"{vtt_ts} line:{pct_y}% position:{pct_x}% align:center",
-                f"<c.card>{card_str}</c>",
-                "",
-            ])
+                    pct_y = max(8, min(88, int(round(max(60, c_obj["y"] - 45) / 1080.0 * 100))))
+                while any(abs(pct_y - prev_py) < 6 and abs(pct_x - prev_px) < 25 for prev_px, prev_py in used_pct_lines):
+                    pct_y = min(92, pct_y + 6) if pct_y <= 80 else max(6, pct_y - 6)
+                used_pct_lines.append((pct_x, pct_y))
+                cue_id = f"{lines[0]}-card" if c_idx == 0 else f"{lines[0]}-card-{c_idx + 1}"
+                vtt_lines.extend([
+                    cue_id,
+                    f"{vtt_ts} line:{pct_y}% position:{pct_x}% align:center",
+                    f"<c.card>{c_obj['text']}</c>",
+                    "",
+                ])
     (BASE_DIR / "transcript.json").write_text(json.dumps(transcript, ensure_ascii=False, indent=2), encoding="utf-8")
     (BASE_DIR / "subtitles.vtt").write_text("\n".join(vtt_lines), encoding="utf-8")
 
@@ -1153,7 +1218,7 @@ HTML_CONTENT = """<!DOCTYPE html>
             <div id="dialogueText" class="text-white font-medium text-base sm:text-lg leading-snug whitespace-pre-line"></div>
           </div>
           <!-- Floating card (positioned at card_x, card_y with bounding clamp and non-blocking clearance) -->
-          <div id="cardBox" class="absolute -translate-x-1/2 -translate-y-1/2 px-3 py-1 rounded bg-black/75 shadow-xl border border-cyan-500/40 font-semibold transition-all duration-150 pointer-events-none" style="display: none; max-width: 90%; box-sizing: border-box; word-break: break-word; text-align: center;"></div>
+          <div id="cardBox" class="absolute -translate-x-1/2 -translate-y-1/2 px-3 py-1 rounded bg-black/75 shadow-xl border border-cyan-500/40 font-semibold transition-all duration-150 pointer-events-none whitespace-pre-line" style="display: none; max-width: 90%; box-sizing: border-box; word-break: break-word; text-align: center;"></div>
         </div>
       </div>
 
@@ -1387,7 +1452,7 @@ HTML_CONTENT = """<!DOCTYPE html>
               ${hasCard ? `<span class="bg-cyan-950 text-cyan-300 text-[10px] px-1.5 py-0.2 rounded font-mono border border-cyan-800/60">定位 ${posLabel}</span>` : ''}
             </div>
             <div class="text-gray-100 font-medium text-sm leading-snug whitespace-pre-line">${item.dialogue}</div>
-            ${hasCard ? `<div style="color:${currentStyle.card_color}; font-family:'${currentStyle.card_font}',sans-serif;" class="font-medium text-xs bg-gray-950/70 p-1.5 rounded border border-gray-800 mt-1">${item.card}</div>` : ''}
+            ${hasCard ? `<div style="color:${currentStyle.card_color}; font-family:'${currentStyle.card_font}',sans-serif;" class="font-medium text-xs bg-gray-950/70 p-1.5 rounded border border-gray-800 mt-1 whitespace-pre-line">${item.card}</div>` : ''}
           </div>
         `;
       }).join('');
@@ -1480,6 +1545,9 @@ HTML_CONTENT = """<!DOCTYPE html>
       const dlgBox = document.getElementById('dialogueBox');
       const dlgText = document.getElementById('dialogueText');
       const cardBox = document.getElementById('cardBox');
+      if (overlay) {
+        overlay.querySelectorAll('.extra-card-box').forEach(el => el.remove());
+      }
 
       if (!activeCue) {
         if (dlgBox) dlgBox.style.display = 'none';
@@ -1498,50 +1566,74 @@ HTML_CONTENT = """<!DOCTYPE html>
           dlgBox.style.display = 'none';
         }
 
-        // 2. Floating Card: 嚴格邊界夾取（防止超出影片）與防遮擋原始字卡淨空
+        // 2. Floating Cards & VTuber Side Comments: 支援多區域獨立定位與垂直防碰撞錯開
         if (hasCard && cardBox) {
-          cardBox.innerText = activeCue.card;
-          cardBox.style.color = currentStyle.card_color || '#00FFFF';
-          cardBox.style.fontFamily = `"${currentStyle.card_font || 'Noto Sans CJK JP'}", sans-serif`;
+          const cardItems = (Array.isArray(activeCue.cards) && activeCue.cards.length > 0)
+            ? activeCue.cards
+            : [{
+                text: activeCue.card,
+                x: activeCue.card_x || 960,
+                y: activeCue.card_y || 820,
+                y_top: activeCue.card_y_top,
+                y_bot: activeCue.card_y_bot
+              }];
+
           const baseSize = currentStyle.card_size || 38;
           const overlayW = overlay ? overlay.clientWidth : 1920;
           const overlayH = overlay ? overlay.clientHeight : 1080;
           const scaledSize = Math.max(13, Math.min(44, Math.round(baseSize * (overlayH / 1080.0))));
-          cardBox.style.fontSize = `${scaledSize}px`;
-          cardBox.style.maxWidth = `${Math.round(overlayW * 0.90)}px`;
-          cardBox.style.display = 'block';
+          const placedBoxes = [];
 
-          // 計算卡片本體尺寸以實施幾何邊界保護
-          const cardW = cardBox.offsetWidth || 120;
-          const cardH = cardBox.offsetHeight || 28;
-          const halfW = cardW / 2;
-          const halfH = cardH / 2;
-
-          // X 座標：依 1920 比例映射，並嚴格夾取於可視區域內 (左右各留 8px 邊界)
-          const targetX = activeCue.card_x ? (activeCue.card_x / 1920.0) * overlayW : overlayW / 2;
-          const clampedX = Math.max(halfW + 8, Math.min(overlayW - halfW - 8, targetX));
-          cardBox.style.left = `${Math.round(clampedX)}px`;
-
-          // Y 座標：若具備字卡上下界 (card_y_top/bot)，確保譯文置於原字卡本體外；否則上浮避讓
-          let targetY;
-          if (activeCue.card_y_top !== undefined && activeCue.card_y_bot !== undefined) {
-            const origTop = (activeCue.card_y_top / 1080.0) * overlayH;
-            const origBot = (activeCue.card_y_bot / 1080.0) * overlayH;
-            if (origTop >= cardH + 14) {
-              targetY = origTop - halfH - 6; // 置於原文字卡上方外側，完全不遮擋原文
-            } else if (overlayH - origBot >= cardH + 14) {
-              targetY = origBot + halfH + 6; // 置於原文字卡下方外側
-            } else {
-              targetY = origTop - halfH - 2;
+          cardItems.forEach((cItem, cIdx) => {
+            const boxEl = (cIdx === 0) ? cardBox : document.createElement('div');
+            if (cIdx > 0 && overlay) {
+              boxEl.className = cardBox.className + ' extra-card-box';
+              overlay.appendChild(boxEl);
             }
-          } else {
-            const rawY = activeCue.card_y ? (activeCue.card_y / 1080.0) * overlayH : overlayH * 0.75;
-            targetY = rawY - cardH - 10;
-          }
-          // 上下邊界嚴格夾取 (上下各留 8px 邊界)
-          const clampedY = Math.max(halfH + 8, Math.min(overlayH - halfH - 8, targetY));
-          cardBox.style.top = `${Math.round(clampedY)}px`;
-          cardBox.style.transform = 'translate(-50%, -50%)';
+            boxEl.innerText = cItem.text || '';
+            boxEl.style.color = currentStyle.card_color || '#00FFFF';
+            boxEl.style.fontFamily = `"${currentStyle.card_font || 'Noto Sans CJK JP'}", sans-serif`;
+            boxEl.style.fontSize = `${scaledSize}px`;
+            boxEl.style.maxWidth = `${Math.round(overlayW * 0.90)}px`;
+            boxEl.style.display = 'block';
+
+            const cardW = boxEl.offsetWidth || 120;
+            const cardH = boxEl.offsetHeight || 28;
+            const halfW = cardW / 2;
+            const halfH = cardH / 2;
+
+            const targetX = cItem.x ? (cItem.x / 1920.0) * overlayW : overlayW / 2;
+            const clampedX = Math.max(halfW + 8, Math.min(overlayW - halfW - 8, targetX));
+            boxEl.style.left = `${Math.round(clampedX)}px`;
+
+            let targetY;
+            if (cItem.y_top !== undefined && cItem.y_bot !== undefined) {
+              const origTop = (cItem.y_top / 1080.0) * overlayH;
+              const origBot = (cItem.y_bot / 1080.0) * overlayH;
+              if (origTop >= cardH + 14) {
+                targetY = origTop - halfH - 6;
+              } else if (overlayH - origBot >= cardH + 14) {
+                targetY = origBot + halfH + 6;
+              } else {
+                targetY = origTop - halfH - 2;
+              }
+            } else {
+              const rawY = cItem.y ? (cItem.y / 1080.0) * overlayH : overlayH * 0.75;
+              targetY = rawY - cardH - 10;
+            }
+
+            const minGapPx = cardH + 6;
+            let attempts = 0;
+            while (placedBoxes.some(pb => Math.abs(clampedX - pb.x) < Math.max(cardW, pb.w) * 0.85 && Math.abs(targetY - pb.y) < minGapPx) && attempts < 10) {
+              targetY += (targetY <= overlayH * 0.78) ? minGapPx : -minGapPx;
+              attempts++;
+            }
+
+            const clampedY = Math.max(halfH + 8, Math.min(overlayH - halfH - 8, targetY));
+            boxEl.style.top = `${Math.round(clampedY)}px`;
+            boxEl.style.transform = 'translate(-50%, -50%)';
+            placedBoxes.push({ x: clampedX, y: clampedY, w: cardW, h: cardH });
+          });
         } else if (cardBox) {
           cardBox.style.display = 'none';
         }

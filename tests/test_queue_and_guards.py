@@ -17,7 +17,10 @@ os.environ["CUDA_VISIBLE_DEVICES"] = ""
 REAL_WORK_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REAL_WORK_DIR))
 
-import pytest
+try:
+    import pytest
+except ImportError:
+    pytest = None
 from fastapi.testclient import TestClient
 import webui_server
 
