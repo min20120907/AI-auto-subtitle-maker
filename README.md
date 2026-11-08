@@ -145,22 +145,32 @@ python3 webui_server.py
 
 | 方法 | 路徑 | 說明 |
 | :--- | :--- | :--- |
-| `GET` | `/` | 載入視覺化操作介面（支援播放器、字卡調整面板、歷史任務） |
+| `GET` | `/` | 載入視覺化操作介面（支援播放器、字卡調整面板、歷史任務與佇列管理） |
+| `GET` \| `HEAD` | `/video/stream` | 串流播放當前啟用影片（支援 HTTP 206 範圍請求與 WebKit 相容 H.264） |
+| `GET` \| `HEAD` | `/subtitles.vtt` | 取得當前影片之 WebVTT 字幕軌（支援原位 cue 座標與字卡自訂樣式） |
+| `GET` \| `HEAD` | `/subtitles.srt` | 下載乾淨雙語/單語 SRT 字幕檔（自動剝除內部【字卡】標記前綴） |
 | `POST` | `/api/upload` | 上傳本機影片檔案，支援執行中隨時連續加入排隊佇列 |
-| `POST` | `/api/youtube` | 提交 YouTube 影片連結，支援執行中隨時連續加入排隊佇列 |
-| `POST` | `/api/translate` | 提交翻譯任務（相容模式，支援多語選擇與 Auto-LID） |
-| `GET` | `/api/status` | 查詢目前單片流水線執行進度狀態 |
+| `POST` | `/api/youtube` | 提交單一 YouTube 影片連結，支援執行中隨時連續加入排隊佇列 |
+| `POST` | `/api/playlist/inspect` | 探測解析 YouTube 播放清單、頻道或多行連結，回傳影片項目供前端勾選（Body: `{"text": "..."}`） |
+| `POST` | `/api/batch/submit` | 批次將勾選的多部影片加入排隊佇列 |
+| `GET` | `/api/status` | 查詢目前單片流水線執行進度狀態與軟字幕標記 |
 | `GET` | `/api/queue` | 查詢統一排隊佇列整體進度與各影片項目詳細狀態 |
-| `POST` | `/api/queue/clear` | 清空待處理排隊佇列並重設佇列進度 |
-| `POST` | `/api/batch/info` | 即時解析 YouTube 播放清單或多個 YouTube 連結資訊 |
-| `POST` | `/api/batch/submit` | 批次將勾選的影片加入排隊佇列 |
+| `POST` | `/api/queue/clear` | 清空待處理排隊佇列（只移除待處理項目，正在處理中的影片會繼續跑完） |
 | `GET` | `/api/style` | 取得字卡顏色、字型與字級設定 |
-| `POST` | `/api/style` | 即時更新字卡樣式並自動刷新預覽 VTT 與 ASS |
+| `POST` | `/api/style` | 即時更新字卡樣式並自動刷新預覽 VTT 與 ASS（若影片處理中則保存設定但延後重繪，回應 `deferred: true`） |
 | `POST` | `/api/burn` | 背景觸發 FFmpeg ASS 燒錄，產出高畫質硬字幕 MP4 |
-| `GET` | `/api/history` | 列出歷史翻譯任務與專屬獨立產物 |
-| `POST` | `/api/history/select` | 切換至特定歷史任務，支援歷史字幕與預覽即時切換 |
-| `GET` | `/subtitles.srt` | 下載乾淨雙語/單語 SRT 字幕（零「【字卡】」殘留） |
-| `GET` | `/subtitles.ass` | 下載含空間座標原位懸浮樣式之 ASS 向量字幕檔 |
+| `GET` | `/api/burn/status` | 查詢硬字幕壓製進度與狀態 |
+| `GET` | `/download/burned` | 下載壓製完成之硬字幕 MP4 影片檔 |
+| `GET` | `/api/transcript` | 取得逐字稿結構化 JSON 資料（含時間軸、原文、譯文與字卡標記） |
+| `GET` | `/api/context` | 取得 Stage 1 全域情境脈絡分析文字 (`global_context.txt`) |
+| `GET` | `/api/cards` | 取得 1080p EasyOCR 偵測之字卡與座標資料 (`ocr_detections.json`) |
+| `GET` | `/api/history` | 列出歷史翻譯任務與專屬獨立產物清單 |
+| `POST` | `/api/history/{job_id}/activate` | 切換並啟用指定歷史任務為當前預覽工作區（若影片處理中回傳 409，避免覆蓋正在處理的工作目錄） |
+| `DELETE` | `/api/history/{job_id}` | 刪除指定歷史任務快照目錄與記錄 |
+
+> [!NOTE]
+> - **併發保護與延後處理**：影片處理中時 `POST /api/history/{job_id}/activate` 會回傳 HTTP 409（避免覆蓋正在處理中的工作目錄）；`POST /api/style` 會保存樣式設定但延後重繪（回應 `{"ok": true, "deferred": true, "style": ...}`）。
+> - **佇列清空範圍**：`POST /api/queue/clear` 只移除待處理排隊項目，正在處理的那部影片會繼續跑完。
 
 ---
 

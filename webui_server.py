@@ -1,4 +1,4 @@
-import os, sys, json, re, time, shutil, subprocess, threading, queue
+import os, sys, json, re, time, shutil, subprocess, threading, queue, uuid
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse, PlainTextResponse
@@ -19,6 +19,7 @@ BATCH_QUEUE = {
     "current_index": 0,
     "current_title": "",
     "percent": 0,
+    "finished_at": None,
     "items": [],  # list of dicts: {id, title, url, src_langs, tgt_langs, status, step, job_id}
 }
 _task_queue = queue.Queue()
@@ -311,6 +312,25 @@ def ensure_h264(video_path: Path):
     except Exception as e:
         print(f"ensure_h264 warning: {e}")
 
+def _enqueue_tasks(task_objs: list[dict]) -> int:
+    with _queue_lock:
+        if not task_objs:
+            return BATCH_QUEUE["total"]
+        if not BATCH_QUEUE["is_running"] and _task_queue.empty():
+            BATCH_QUEUE["total"] = 0
+            BATCH_QUEUE["current_index"] = 0
+            BATCH_QUEUE["percent"] = 0
+            BATCH_QUEUE["items"] = []
+            BATCH_QUEUE["finished_at"] = None
+
+        for task_obj in task_objs:
+            BATCH_QUEUE["items"].append(task_obj)
+            _task_queue.put(task_obj)
+
+        BATCH_QUEUE["total"] += len(task_objs)
+        BATCH_QUEUE["is_running"] = True
+        return BATCH_QUEUE["total"]
+
 def _queue_worker_loop():
     """Background worker processing unified queue (YouTube, uploaded files, playlists) sequentially"""
     while True:
@@ -381,6 +401,7 @@ def _queue_worker_loop():
                     BATCH_QUEUE["is_running"] = False
                     BATCH_QUEUE["current_title"] = "全部處理完成"
                     BATCH_QUEUE["percent"] = 100
+                    BATCH_QUEUE["finished_at"] = time.time()
 
 def parse_playlist_or_channel(url: str) -> dict | None:
     """使用 yt-dlp 快速探測解析播放清單或頻道列表，不下載實際影片"""
@@ -428,6 +449,22 @@ def parse_playlist_or_channel(url: str) -> dict | None:
     except Exception as ex:
         print(f"parse_playlist error: {ex}")
         return None
+
+def _cleanup_stale_uploads():
+    uploads_dir = BASE_DIR / "uploads"
+    if not uploads_dir.exists():
+        return
+    now = time.time()
+    cutoff = now - 86400  # 24 hours
+    for p in uploads_dir.iterdir():
+        if p.is_file():
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink(missing_ok=True)
+            except Exception as e:
+                print(f"_cleanup_stale_uploads error deleting {p}: {e}")
+
+_cleanup_stale_uploads()
 
 # Start persistent queue worker thread
 threading.Thread(target=_queue_worker_loop, daemon=True).start()
@@ -648,6 +685,8 @@ async def update_style(request: Request):
         except Exception:
             pass
     cfg = save_style(allowed)
+    if JOB_STATUS.get("state") == "running":
+        return JSONResponse({"ok": True, "style": cfg, "deferred": True})
     active = next((x for x in load_history() if x.get("id") == JOB_STATUS.get("active_id")), {})
     tgt_langs = active.get("tgt_langs") or ["zh-TW"]
     env = {
@@ -664,7 +703,7 @@ async def update_style(request: Request):
         if job_id and (JOBS_DIR / job_id).exists():
             for fname in ["context_subtitles_1080p.ass", "subtitles.vtt", "transcript.json"]:
                 _link_or_copy(BASE_DIR / fname, JOBS_DIR / job_id / fname)
-    return JSONResponse({"ok": True, "style": cfg})
+    return JSONResponse({"ok": True, "style": cfg, "deferred": False})
 
 @app.get("/api/transcript")
 def get_transcript():
@@ -701,6 +740,8 @@ def get_history():
 
 @app.post("/api/history/{job_id}/activate")
 def activate_history(job_id: str):
+    if JOB_STATUS.get("state") == "running":
+        raise HTTPException(status_code=409, detail="影片處理中，請待目前任務完成後再切換記錄")
     items = load_history()
     target = next((x for x in items if x.get("id") == job_id), None)
     if not target:
@@ -728,20 +769,60 @@ def get_queue():
 
 @app.post("/api/queue/clear")
 def clear_queue():
+    removed = 0
     with _queue_lock:
         while not _task_queue.empty():
             try:
-                _task_queue.get_nowait()
+                task = _task_queue.get_nowait()
                 _task_queue.task_done()
-            except Exception:
-                pass
-        BATCH_QUEUE["is_running"] = False
-        BATCH_QUEUE["total"] = 0
-        BATCH_QUEUE["current_index"] = 0
-        BATCH_QUEUE["current_title"] = ""
-        BATCH_QUEUE["percent"] = 0
-        BATCH_QUEUE["items"] = []
-    return JSONResponse({"ok": True, "queue": BATCH_QUEUE})
+                removed += 1
+                if isinstance(task, dict) and task.get("type") == "file":
+                    fp_str = task.get("file_path")
+                    if fp_str:
+                        fp = Path(fp_str)
+                        if fp.exists():
+                            try:
+                                fp.unlink()
+                            except Exception as e:
+                                print(f"clear_queue error deleting temp file {fp}: {e}")
+            except queue.Empty:
+                break
+            except Exception as ex:
+                print(f"clear_queue error draining queue: {ex}")
+
+        # Clean any remaining pending file tasks from BATCH_QUEUE items
+        for it in BATCH_QUEUE.get("items", []):
+            if it.get("status") != "running" and it.get("type") == "file":
+                fp_str = it.get("file_path")
+                if fp_str:
+                    try:
+                        fp = Path(fp_str)
+                        if fp.exists():
+                            fp.unlink()
+                    except Exception as e:
+                        print(f"clear_queue error deleting temp file {fp_str}: {e}")
+
+        running_items = [it for it in BATCH_QUEUE.get("items", []) if it.get("status") == "running"]
+        if running_items:
+            BATCH_QUEUE["items"] = [running_items[0]]
+            BATCH_QUEUE["is_running"] = True
+            BATCH_QUEUE["total"] = 1
+            BATCH_QUEUE["current_index"] = 1
+            BATCH_QUEUE["percent"] = 0
+            # current_title 維持
+        else:
+            BATCH_QUEUE["items"] = []
+            BATCH_QUEUE["is_running"] = False
+            BATCH_QUEUE["total"] = 0
+            BATCH_QUEUE["current_index"] = 0
+            BATCH_QUEUE["percent"] = 0
+            BATCH_QUEUE["current_title"] = ""
+            if "finished_at" in BATCH_QUEUE:
+                BATCH_QUEUE["finished_at"] = None
+
+        queue_snapshot = dict(BATCH_QUEUE)
+
+    return JSONResponse({"ok": True, "removed": removed, "queue": queue_snapshot})
 
 @app.post("/api/playlist/inspect")
 async def inspect_playlist(request: Request):
@@ -794,39 +875,30 @@ async def submit_batch(request: Request):
     src_langs = body.get("src_langs") or ["auto"]
     tgt_langs = body.get("tgt_langs") or ["zh-TW"]
 
-    added_count = 0
-    with _queue_lock:
-        if not BATCH_QUEUE["is_running"] and _task_queue.empty():
-            BATCH_QUEUE["total"] = 0
-            BATCH_QUEUE["current_index"] = 0
-            BATCH_QUEUE["percent"] = 0
-            BATCH_QUEUE["items"] = []
+    task_objs = []
+    for it in items:
+        u = it.get("url")
+        if not u:
+            continue
+        t_id = f"task_{uuid.uuid4().hex[:12]}"
+        task_objs.append({
+            "id": t_id,
+            "type": "youtube",
+            "title": it.get("title") or u,
+            "url": u,
+            "src_langs": src_langs,
+            "tgt_langs": tgt_langs,
+            "status": "pending",
+            "step": "排隊中",
+            "job_id": None,
+        })
 
-        for it in items:
-            u = it.get("url")
-            if not u:
-                continue
-            t_id = f"task_{int(time.time()*1000)}_{added_count}"
-            task_obj = {
-                "id": t_id,
-                "type": "youtube",
-                "title": it.get("title") or u,
-                "url": u,
-                "src_langs": src_langs,
-                "tgt_langs": tgt_langs,
-                "status": "pending",
-                "step": "排隊中",
-                "job_id": None,
-            }
-            BATCH_QUEUE["items"].append(task_obj)
-            BATCH_QUEUE["total"] += 1
-            _task_queue.put(task_obj)
-            added_count += 1
+    queue_total = _enqueue_tasks(task_objs)
 
     return JSONResponse({
         "ok": True,
-        "added": added_count,
-        "queue_total": BATCH_QUEUE["total"]
+        "added": len(task_objs),
+        "queue_total": queue_total
     })
 
 @app.post("/api/upload")
@@ -841,7 +913,7 @@ async def upload_video(
     uploads_dir = BASE_DIR / "uploads"
     uploads_dir.mkdir(parents=True, exist_ok=True)
 
-    t_id = f"task_{int(time.time()*1000)}"
+    t_id = f"task_{uuid.uuid4().hex[:12]}"
     dest_path = uploads_dir / f"{t_id}_{safe_name}"
 
     with open(dest_path, "wb") as f:
@@ -860,22 +932,12 @@ async def upload_video(
         "job_id": None,
     }
 
-    with _queue_lock:
-        if not BATCH_QUEUE["is_running"] and _task_queue.empty():
-            BATCH_QUEUE["total"] = 0
-            BATCH_QUEUE["current_index"] = 0
-            BATCH_QUEUE["percent"] = 0
-            BATCH_QUEUE["items"] = []
-
-        BATCH_QUEUE["items"].append(task_obj)
-        BATCH_QUEUE["total"] += 1
-        _task_queue.put(task_obj)
-        total_in_queue = BATCH_QUEUE["total"]
+    queue_total = _enqueue_tasks([task_obj])
 
     return JSONResponse({
         "ok": True,
         "queued": True,
-        "queue_total": total_in_queue,
+        "queue_total": queue_total,
         "status": JOB_STATUS
     })
 
@@ -888,7 +950,7 @@ async def upload_youtube(request: Request):
     s_list = body.get("src_langs") or ["auto"]
     t_list = body.get("tgt_langs") or ["zh-TW"]
 
-    t_id = f"task_{int(time.time()*1000)}"
+    t_id = f"task_{uuid.uuid4().hex[:12]}"
     task_obj = {
         "id": t_id,
         "type": "youtube",
@@ -901,22 +963,12 @@ async def upload_youtube(request: Request):
         "job_id": None,
     }
 
-    with _queue_lock:
-        if not BATCH_QUEUE["is_running"] and _task_queue.empty():
-            BATCH_QUEUE["total"] = 0
-            BATCH_QUEUE["current_index"] = 0
-            BATCH_QUEUE["percent"] = 0
-            BATCH_QUEUE["items"] = []
-
-        BATCH_QUEUE["items"].append(task_obj)
-        BATCH_QUEUE["total"] += 1
-        _task_queue.put(task_obj)
-        total_in_queue = BATCH_QUEUE["total"]
+    queue_total = _enqueue_tasks([task_obj])
 
     return JSONResponse({
         "ok": True,
         "queued": True,
-        "queue_total": total_in_queue,
+        "queue_total": queue_total,
         "status": JOB_STATUS
     })
 
@@ -1213,6 +1265,13 @@ HTML_CONTENT = """<!DOCTYPE html>
         const data = await res.json();
         currentStyle = data.style;
         injectCueStyle();
+        if (data.deferred) {
+          const badge = document.getElementById('jobBadge');
+          if (badge) {
+            badge.classList.remove('hidden');
+            badge.innerText = '🎨 樣式已儲存，將於目前任務完成後套用';
+          }
+        }
         renderTranscript(cues);
         refreshTrack();
         const cardBox = document.getElementById('cardBox');
@@ -1487,6 +1546,13 @@ HTML_CONTENT = """<!DOCTYPE html>
         loadTranscript();
         loadMeta();
         loadHistory();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        const badge = document.getElementById('jobBadge');
+        if (badge) {
+          badge.classList.remove('hidden');
+          badge.innerText = `⚠️ ${err.detail || '切換記錄失敗'}`;
+        }
       }
     }
 
@@ -1700,9 +1766,25 @@ HTML_CONTENT = """<!DOCTYPE html>
 
     async function clearBatchQueue() {
       if (!confirm('確定要清空目前所有排隊中的批次任務嗎？')) return;
-      await fetch('/api/queue/clear', { method: 'POST' });
+      try {
+        const res = await fetch('/api/queue/clear', { method: 'POST' });
+        if (res.ok) {
+          const data = await res.json();
+          const count = data.removed !== undefined ? data.removed : 0;
+          const badge = document.getElementById('jobBadge');
+          if (badge) {
+            badge.classList.remove('hidden');
+            badge.innerText = `🧹 已移除 ${count} 部待處理影片`;
+          }
+        }
+      } catch (err) {
+        console.error('clearBatchQueue error:', err);
+      }
       pollStatus();
     }
+
+    let lastQueueRunning = false;
+    let lastState = null;
 
     async function pollStatus() {
       const badge = document.getElementById('jobBadge');
@@ -1723,15 +1805,32 @@ HTML_CONTENT = """<!DOCTYPE html>
 
       if (st.title) document.getElementById('videoSubtitle').innerText = `${st.title} (全域上下文分析 + 畫面字卡 OCR 提取)`;
 
-      // 進度條控制 (Batch Queue 或 單片 Job 狀態)
-      const hasQueue = q && (q.is_running || q.total > 0 || (q.items && q.items.length > 0));
-      if (hasQueue) {
+      const isQueueRunning = !!(q && q.is_running);
+      const queueJustFinished = lastQueueRunning && !isQueueRunning;
+      lastQueueRunning = isQueueRunning;
+
+      const stateJustDone = (lastState === 'running' && st.state === 'done');
+      lastState = st.state;
+
+      // Banner 顯示條件
+      const isQueueFinished = !!(q && !q.is_running && q.finished_at);
+      const finishedElapsed = isQueueFinished ? ((Date.now() / 1000) - q.finished_at) : 999;
+      const isQueueFinishedRecently = isQueueFinished && (finishedElapsed <= 8);
+
+      if (isQueueRunning) {
         banner.classList.remove('hidden');
-        progressTitle.innerText = q.is_running ? `正在處理: ${q.current_title || '影片'}` : (q.percent === 100 ? '✅ 全部批次處理完成' : '佇列已就緒');
+        progressTitle.innerText = `正在處理: ${q.current_title || '影片'}`;
         progressCount.innerText = `進度: ${q.current_index} / ${q.total} 部`;
         progressPercent.innerText = `${q.percent}%`;
         progressBar.style.width = `${q.percent}%`;
         currentStep.innerText = st.step || '排隊執行中...';
+      } else if (isQueueFinishedRecently) {
+        banner.classList.remove('hidden');
+        progressTitle.innerText = '✅ 全部處理完成';
+        progressCount.innerText = `進度: ${q.current_index} / ${q.total} 部`;
+        progressPercent.innerText = '100%';
+        progressBar.style.width = '100%';
+        currentStep.innerText = '全部完成';
       } else if (st.state === 'running') {
         banner.classList.remove('hidden');
         progressTitle.innerText = `正在處理: ${st.title || '影片'}`;
@@ -1748,21 +1847,36 @@ HTML_CONTENT = """<!DOCTYPE html>
         banner.classList.add('hidden');
       }
 
-      if (st.state === 'running' || (q && q.is_running)) {
+      if (st.state === 'running' || isQueueRunning) {
         badge.classList.remove('hidden');
         badge.innerText = `⏳ ${st.step}`;
         setTimeout(pollStatus, 2500);
-      } else if (st.state === 'done') {
+      } else if (st.state === 'done' || isQueueFinishedRecently) {
         badge.classList.remove('hidden');
         badge.innerText = st.step;
-        video.src = '/video/stream?t=' + Date.now();
-        video.load();
-        refreshTrack();
-        loadTranscript();
-        loadMeta();
+        if (queueJustFinished || stateJustDone) {
+          video.src = '/video/stream?t=' + Date.now();
+          video.load();
+          refreshTrack();
+          loadTranscript();
+          loadMeta();
+        }
+        if (isQueueFinishedRecently) {
+          setTimeout(pollStatus, 2500);
+        }
       } else if (st.state === 'error') {
         badge.classList.remove('hidden');
         badge.innerText = st.step;
+        if (queueJustFinished) {
+          video.src = '/video/stream?t=' + Date.now();
+          video.load();
+          refreshTrack();
+          loadTranscript();
+          loadMeta();
+        }
+        if (isQueueFinishedRecently) {
+          setTimeout(pollStatus, 2500);
+        }
       }
     }
 

@@ -28,6 +28,7 @@ ENV/
 # Ephemeral Directories & Frame Caches
 frames/
 jobs/
+uploads/
 tmp/
 .cache/
 
