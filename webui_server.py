@@ -1395,7 +1395,19 @@ HTML_CONTENT = """<!DOCTYPE html>
         const el = document.getElementById(`cue-${activeIdx}`);
         if (el) {
           el.classList.add('active-cue');
-          el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+          // 僅滾動字幕容器 transcriptList 內部，防止手機版觸發 window/viewport 滾動將影片推移
+          const container = document.getElementById('transcriptList');
+          if (container) {
+            const elTop = el.offsetTop - container.offsetTop;
+            const elBottom = elTop + el.offsetHeight;
+            const viewTop = container.scrollTop;
+            const viewBottom = viewTop + container.clientHeight;
+            if (elTop < viewTop) {
+              container.scrollTo({ top: elTop - 12, behavior: 'smooth' });
+            } else if (elBottom > viewBottom) {
+              container.scrollTo({ top: elBottom - container.clientHeight + 12, behavior: 'smooth' });
+            }
+          }
         }
       }
 
