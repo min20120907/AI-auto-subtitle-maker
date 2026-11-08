@@ -33,6 +33,18 @@
 - **按需壓製 (On-Demand Burn)**：需要導出完整 MP4 檔案時，點擊「🔥 硬字幕影片」後端才在背景以 FFmpeg ASS filter 壓製。
 - **Apple WebKit 完美相容**：針對 YouTube Shorts 常見的 VP9/AV1 格式，自動轉換為標準相容之 `H.264 (yuv420p) + AAC + faststart` 容器，在 iPadOS / iOS Brave 及 Safari 上順暢拖曳進度條不黑屏。
 
+### 5. 隨時連續排隊上傳 (Continuous Queue Ingestion)
+- **非阻塞隨時追加**：影片正在轉錄或翻譯時，無須等待當前任務結束，用戶可隨時透過「📤 上傳檔案」或「🔗 載入 YT」繼續投遞新影片。
+- **統一排隊佇列 (Unified Task Queue)**：自動判斷當前執行狀態；若系統忙碌則無縫塞入佇列 (`BATCH_QUEUE`)，依序無縫銜接處理，暫存檔案在處理完畢後自動清理，杜絕磁碟殘留。
+
+### 6. YouTube 播放清單與多連結批次挑選 (Playlist & Multi-Link Batch Ingestion)
+- **播放清單即時解析**：貼上 YouTube 播放清單網址，自動解析所有子影片標題與網址，提供全選、反選與個別勾選彈窗。
+- **多行網址批次解析**：支援一次貼入多組 YouTube 網址，一鍵抓取標題並列入清單供篩選匯入。
+
+### 7. 即時雙層進度條 (Dual-Layer Progress Dashboard)
+- **整體佇列進度條**：橫幅頂部即時顯示「進度：第 X / Y 部 (整體百分比)」，隨時掌握整個佇列處理進程。
+- **單片流水線階段進度**：同步顯示當前處理中影片的細部進度（如「抽影格 OCR」、「雙階段 LLM 翻譯」），並可點擊「❌ 清空佇列」按鈕隨時重設。
+
 ---
 
 ## 系統架構流程圖 (Architecture Flowchart)
@@ -134,8 +146,14 @@ python3 webui_server.py
 | 方法 | 路徑 | 說明 |
 | :--- | :--- | :--- |
 | `GET` | `/` | 載入視覺化操作介面（支援播放器、字卡調整面板、歷史任務） |
-| `POST` | `/api/translate` | 提交翻譯任務（支援 YouTube URL 或本地 MP4 上傳、多語選擇、Auto-LID） |
-| `GET` | `/api/status` | 查詢目前流水線執行進度狀態 |
+| `POST` | `/api/upload` | 上傳本機影片檔案，支援執行中隨時連續加入排隊佇列 |
+| `POST` | `/api/youtube` | 提交 YouTube 影片連結，支援執行中隨時連續加入排隊佇列 |
+| `POST` | `/api/translate` | 提交翻譯任務（相容模式，支援多語選擇與 Auto-LID） |
+| `GET` | `/api/status` | 查詢目前單片流水線執行進度狀態 |
+| `GET` | `/api/queue` | 查詢統一排隊佇列整體進度與各影片項目詳細狀態 |
+| `POST` | `/api/queue/clear` | 清空待處理排隊佇列並重設佇列進度 |
+| `POST` | `/api/batch/info` | 即時解析 YouTube 播放清單或多個 YouTube 連結資訊 |
+| `POST` | `/api/batch/submit` | 批次將勾選的影片加入排隊佇列 |
 | `GET` | `/api/style` | 取得字卡顏色、字型與字級設定 |
 | `POST` | `/api/style` | 即時更新字卡樣式並自動刷新預覽 VTT 與 ASS |
 | `POST` | `/api/burn` | 背景觸發 FFmpeg ASS 燒錄，產出高畫質硬字幕 MP4 |

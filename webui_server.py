@@ -312,8 +312,9 @@ def ensure_h264(video_path: Path):
         print(f"ensure_h264 warning: {e}")
 
 def _queue_worker_loop():
-    """Background worker processing batch YouTube & playlist queue sequentially"""
+    """Background worker processing unified queue (YouTube, uploaded files, playlists) sequentially"""
     while True:
+        task = None
         try:
             task = _task_queue.get()
             if task is None:
@@ -321,7 +322,7 @@ def _queue_worker_loop():
             with _queue_lock:
                 BATCH_QUEUE["is_running"] = True
                 BATCH_QUEUE["current_index"] += 1
-                BATCH_QUEUE["current_title"] = task.get("title") or task.get("url")
+                BATCH_QUEUE["current_title"] = task.get("title") or task.get("url") or "影片處理中"
                 total = max(1, BATCH_QUEUE["total"])
                 # Overall percent based on completed items + stage progress
                 BATCH_QUEUE["percent"] = int(round(((BATCH_QUEUE["current_index"] - 1) / total) * 100))
@@ -331,9 +332,24 @@ def _queue_worker_loop():
                         item["step"] = "正在處理中..."
                         break
 
-            print(f"[Queue Worker] Processing {BATCH_QUEUE['current_index']}/{total}: {task.get('title')}")
-            # Execute pipeline
-            run_youtube_pipeline(task["url"], task["src_langs"], task["tgt_langs"])
+            print(f"[Queue Worker] Processing {BATCH_QUEUE['current_index']}/{total} [{task.get('type')}]: {task.get('title')}")
+
+            task_type = task.get("type", "youtube")
+            if task_type == "youtube":
+                run_youtube_pipeline(task["url"], task["src_langs"], task["tgt_langs"])
+            elif task_type == "file":
+                file_path = Path(task["file_path"])
+                try:
+                    run_pipeline(file_path, task["title"], task["src_langs"], task["tgt_langs"])
+                finally:
+                    # Clean up temporary uploaded file after pipeline run
+                    try:
+                        if file_path.exists():
+                            file_path.unlink()
+                    except Exception as clean_err:
+                        print(f"[Queue Worker] Clean temp file error: {clean_err}")
+            else:
+                print(f"[Queue Worker] Unknown task type: {task_type}")
 
             with _queue_lock:
                 current_percent = int(round((BATCH_QUEUE["current_index"] / total) * 100))
@@ -350,8 +366,16 @@ def _queue_worker_loop():
                         break
         except Exception as e:
             print(f"[Queue Worker Exception]: {e}")
+            if task:
+                with _queue_lock:
+                    for item in BATCH_QUEUE["items"]:
+                        if item["id"] == task["id"]:
+                            item["status"] = "error"
+                            item["step"] = f"例外失敗: {e}"
+                            break
         finally:
-            _task_queue.task_done()
+            if task is not None:
+                _task_queue.task_done()
             with _queue_lock:
                 if _task_queue.empty():
                     BATCH_QUEUE["is_running"] = False
@@ -785,6 +809,7 @@ async def submit_batch(request: Request):
             t_id = f"task_{int(time.time()*1000)}_{added_count}"
             task_obj = {
                 "id": t_id,
+                "type": "youtube",
                 "title": it.get("title") or u,
                 "url": u,
                 "src_langs": src_langs,
@@ -810,33 +835,90 @@ async def upload_video(
     src_langs: str = Form("auto"),
     tgt_langs: str = Form("zh-TW"),
 ):
-    if JOB_STATUS["state"] == "running":
-        raise HTTPException(status_code=409, detail="已有影片正在處理中，請稍候")
     s_list = [x.strip() for x in src_langs.split(",") if x.strip()] or ["auto"]
     t_list = [x.strip() for x in tgt_langs.split(",") if x.strip()] or ["zh-TW"]
     safe_name = Path(file.filename or "uploaded.mp4").name
-    raw_dest = BASE_DIR / "uploaded_input.mp4"
-    with open(raw_dest, "wb") as f:
+    uploads_dir = BASE_DIR / "uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+
+    t_id = f"task_{int(time.time()*1000)}"
+    dest_path = uploads_dir / f"{t_id}_{safe_name}"
+
+    with open(dest_path, "wb") as f:
         while chunk := await file.read(1024 * 1024):
             f.write(chunk)
-    ensure_h264(raw_dest)
-    JOB_STATUS.update({"state": "running", "step": "已上傳，準備開始處理...", "title": safe_name})
-    threading.Thread(target=run_pipeline, args=(raw_dest, safe_name, s_list, t_list), daemon=True).start()
-    return JSONResponse({"ok": True, "status": JOB_STATUS})
+
+    task_obj = {
+        "id": t_id,
+        "type": "file",
+        "title": safe_name,
+        "file_path": str(dest_path),
+        "src_langs": s_list,
+        "tgt_langs": t_list,
+        "status": "pending",
+        "step": "排隊中",
+        "job_id": None,
+    }
+
+    with _queue_lock:
+        if not BATCH_QUEUE["is_running"] and _task_queue.empty():
+            BATCH_QUEUE["total"] = 0
+            BATCH_QUEUE["current_index"] = 0
+            BATCH_QUEUE["percent"] = 0
+            BATCH_QUEUE["items"] = []
+
+        BATCH_QUEUE["items"].append(task_obj)
+        BATCH_QUEUE["total"] += 1
+        _task_queue.put(task_obj)
+        total_in_queue = BATCH_QUEUE["total"]
+
+    return JSONResponse({
+        "ok": True,
+        "queued": True,
+        "queue_total": total_in_queue,
+        "status": JOB_STATUS
+    })
 
 @app.post("/api/youtube")
 async def upload_youtube(request: Request):
-    if JOB_STATUS["state"] == "running":
-        raise HTTPException(status_code=409, detail="已有影片正在處理中，請稍候")
     body = await request.json()
     url = (body.get("url") or "").strip()
     if not re.match(r"^https?://", url):
         raise HTTPException(status_code=400, detail="請輸入有效的 http/https 影片連結")
     s_list = body.get("src_langs") or ["auto"]
     t_list = body.get("tgt_langs") or ["zh-TW"]
-    JOB_STATUS.update({"state": "running", "step": "準備下載 YouTube 影片...", "title": url})
-    threading.Thread(target=run_youtube_pipeline, args=(url, s_list, t_list), daemon=True).start()
-    return JSONResponse({"ok": True, "status": JOB_STATUS})
+
+    t_id = f"task_{int(time.time()*1000)}"
+    task_obj = {
+        "id": t_id,
+        "type": "youtube",
+        "title": url,
+        "url": url,
+        "src_langs": s_list,
+        "tgt_langs": t_list,
+        "status": "pending",
+        "step": "排隊中",
+        "job_id": None,
+    }
+
+    with _queue_lock:
+        if not BATCH_QUEUE["is_running"] and _task_queue.empty():
+            BATCH_QUEUE["total"] = 0
+            BATCH_QUEUE["current_index"] = 0
+            BATCH_QUEUE["percent"] = 0
+            BATCH_QUEUE["items"] = []
+
+        BATCH_QUEUE["items"].append(task_obj)
+        BATCH_QUEUE["total"] += 1
+        _task_queue.put(task_obj)
+        total_in_queue = BATCH_QUEUE["total"]
+
+    return JSONResponse({
+        "ok": True,
+        "queued": True,
+        "queue_total": total_in_queue,
+        "status": JOB_STATUS
+    })
 
 HTML_CONTENT = """<!DOCTYPE html>
 <html lang="zh-TW">
@@ -1448,12 +1530,15 @@ HTML_CONTENT = """<!DOCTYPE html>
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url, src_langs, tgt_langs })
       });
+      const data = await res.json();
       if (!res.ok) {
-        const err = await res.json();
-        badge.innerText = `❌ ${err.detail || '送出失敗'}`;
+        badge.innerText = `❌ ${data.detail || '送出失敗'}`;
         return;
       }
       input.value = '';
+      if (data.queued && data.queue_total > 1) {
+        badge.innerText = `⏳ 已加入排隊佇列 (第 ${data.queue_total} 部)`;
+      }
       pollStatus();
     }
 
@@ -1470,10 +1555,13 @@ HTML_CONTENT = """<!DOCTYPE html>
       fd.append('src_langs', src_langs.join(','));
       fd.append('tgt_langs', tgt_langs.join(','));
       const res = await fetch('/api/upload', { method: 'POST', body: fd });
+      const data = await res.json();
       if (!res.ok) {
-        const err = await res.json();
-        badge.innerText = `❌ ${err.detail || '上傳失敗'}`;
+        badge.innerText = `❌ ${data.detail || '上傳失敗'}`;
         return;
+      }
+      if (data.queued && data.queue_total > 1) {
+        badge.innerText = `⏳ 已加入排隊佇列 (第 ${data.queue_total} 部)`;
       }
       pollStatus();
     }
@@ -1636,10 +1724,10 @@ HTML_CONTENT = """<!DOCTYPE html>
       if (st.title) document.getElementById('videoSubtitle').innerText = `${st.title} (全域上下文分析 + 畫面字卡 OCR 提取)`;
 
       // 進度條控制 (Batch Queue 或 單片 Job 狀態)
-      const hasQueue = q && (q.is_running || q.total > 1 || (q.items && q.items.length > 0));
+      const hasQueue = q && (q.is_running || q.total > 0 || (q.items && q.items.length > 0));
       if (hasQueue) {
         banner.classList.remove('hidden');
-        progressTitle.innerText = q.is_running ? `正在處理: ${q.current_title || '影片'}` : (q.percent === 100 ? '✅ 全部批次處理完成' : '佇列已暫停');
+        progressTitle.innerText = q.is_running ? `正在處理: ${q.current_title || '影片'}` : (q.percent === 100 ? '✅ 全部批次處理完成' : '佇列已就緒');
         progressCount.innerText = `進度: ${q.current_index} / ${q.total} 部`;
         progressPercent.innerText = `${q.percent}%`;
         progressBar.style.width = `${q.percent}%`;
