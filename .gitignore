@@ -1,0 +1,65 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Large Media Files
+*.mp4
+*.mkv
+*.webm
+*.mov
+*.avi
+*.wav
+*.mp3
+*.flac
+*.aac
+*.jpg
+*.jpeg
+*.png
+*.webp
+
+# Ephemeral Directories & Frame Caches
+frames/
+jobs/
+tmp/
+.cache/
+
+# Logs and Process IDs
+*.log
+*.pid
+
+# Sensitive Credentials
+cookies.txt
+*.pem
+*.key
+*.token
+
+# Runtime Generated Workspace Outputs
+clean_orig.srt
+raw_merged.srt
+context_translated_*.srt
+context_translated_zh.srt
+subtitles.vtt
+context_subtitles_1080p.ass
+ocr_detections.json
+transcript.json
+global_context.txt
+style_config.json
+history.json
+video_preview_tmp.mp4
+uploaded_input.mp4
+video_context_1080p.mp4
+
+# Editor / System artifacts
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.bak
