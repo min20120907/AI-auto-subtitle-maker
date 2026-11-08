@@ -1,4 +1,4 @@
-import os, sys, json, re, time, shutil, subprocess, threading
+import os, sys, json, re, time, shutil, subprocess, threading, queue
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse, PlainTextResponse
@@ -10,8 +10,19 @@ HISTORY_FILE = BASE_DIR / "history.json"
 STYLE_FILE = BASE_DIR / "style_config.json"
 app = FastAPI(title="Video Context Subtitle WebUI")
 
-# ponytail: single global job state; switch to task queue if multi-user concurrent uploads needed
+# Global job status and batch queue management
 JOB_STATUS = {"state": "idle", "step": "就緒", "title": "甘橘 (감귤) - 東京池袋日常 Vlog", "active_id": "job_ikebukuro"}
+
+BATCH_QUEUE = {
+    "is_running": False,
+    "total": 0,
+    "current_index": 0,
+    "current_title": "",
+    "percent": 0,
+    "items": [],  # list of dicts: {id, title, url, src_langs, tgt_langs, status, step, job_id}
+}
+_task_queue = queue.Queue()
+_queue_lock = threading.Lock()
 
 ARTIFACT_FILES = [
     "video_context_1080p.mp4",
@@ -299,6 +310,103 @@ def ensure_h264(video_path: Path):
             tmp_path.replace(video_path)
     except Exception as e:
         print(f"ensure_h264 warning: {e}")
+
+def _queue_worker_loop():
+    """Background worker processing batch YouTube & playlist queue sequentially"""
+    while True:
+        try:
+            task = _task_queue.get()
+            if task is None:
+                break
+            with _queue_lock:
+                BATCH_QUEUE["is_running"] = True
+                BATCH_QUEUE["current_index"] += 1
+                BATCH_QUEUE["current_title"] = task.get("title") or task.get("url")
+                total = max(1, BATCH_QUEUE["total"])
+                # Overall percent based on completed items + stage progress
+                BATCH_QUEUE["percent"] = int(round(((BATCH_QUEUE["current_index"] - 1) / total) * 100))
+                for item in BATCH_QUEUE["items"]:
+                    if item["id"] == task["id"]:
+                        item["status"] = "running"
+                        item["step"] = "正在處理中..."
+                        break
+
+            print(f"[Queue Worker] Processing {BATCH_QUEUE['current_index']}/{total}: {task.get('title')}")
+            # Execute pipeline
+            run_youtube_pipeline(task["url"], task["src_langs"], task["tgt_langs"])
+
+            with _queue_lock:
+                current_percent = int(round((BATCH_QUEUE["current_index"] / total) * 100))
+                BATCH_QUEUE["percent"] = min(100, current_percent)
+                for item in BATCH_QUEUE["items"]:
+                    if item["id"] == task["id"]:
+                        if JOB_STATUS.get("state") == "error":
+                            item["status"] = "error"
+                            item["step"] = JOB_STATUS.get("step") or "失敗"
+                        else:
+                            item["status"] = "done"
+                            item["step"] = "完成"
+                            item["job_id"] = JOB_STATUS.get("active_id")
+                        break
+        except Exception as e:
+            print(f"[Queue Worker Exception]: {e}")
+        finally:
+            _task_queue.task_done()
+            with _queue_lock:
+                if _task_queue.empty():
+                    BATCH_QUEUE["is_running"] = False
+                    BATCH_QUEUE["current_title"] = "全部處理完成"
+                    BATCH_QUEUE["percent"] = 100
+
+def parse_playlist_or_channel(url: str) -> dict | None:
+    """使用 yt-dlp 快速探測解析播放清單或頻道列表，不下載實際影片"""
+    yt_dlp = str(Path(sys.executable).parent / "yt-dlp")
+    try:
+        res = subprocess.run(
+            [yt_dlp, "--flat-playlist", "-J", url],
+            capture_output=True, text=True, timeout=40
+        )
+        if res.returncode != 0 or not res.stdout.strip():
+            return None
+        data = json.loads(res.stdout.strip())
+        if not isinstance(data, dict):
+            return None
+        entries = data.get("entries")
+        if not entries or not isinstance(entries, list):
+            return None
+        items = []
+        for idx, e in enumerate(entries, 1):
+            if not isinstance(e, dict):
+                continue
+            v_url = e.get("url")
+            if not v_url or not str(v_url).startswith("http"):
+                vid = e.get("id")
+                v_url = f"https://www.youtube.com/watch?v={vid}" if vid else None
+            if not v_url:
+                continue
+            dur = e.get("duration") or 0
+            dur_str = f"{int(dur//60)}:{int(dur%60):02d}" if dur else ""
+            items.append({
+                "index": idx,
+                "id": str(e.get("id") or idx),
+                "title": e.get("title") or f"影片 #{idx}",
+                "url": v_url,
+                "duration": dur,
+                "duration_str": dur_str,
+            })
+        if not items:
+            return None
+        return {
+            "title": data.get("title") or "YouTube 播放清單",
+            "total": len(items),
+            "items": items,
+        }
+    except Exception as ex:
+        print(f"parse_playlist error: {ex}")
+        return None
+
+# Start persistent queue worker thread
+threading.Thread(target=_queue_worker_loop, daemon=True).start()
 
 def run_youtube_pipeline(url: str, src_langs: list[str], tgt_langs: list[str]):
     try:
@@ -589,6 +697,113 @@ def delete_history(job_id: str):
     shutil.rmtree(JOBS_DIR / job_id, ignore_errors=True)
     return JSONResponse({"ok": True, "items": items})
 
+@app.get("/api/queue")
+def get_queue():
+    with _queue_lock:
+        return JSONResponse(dict(BATCH_QUEUE))
+
+@app.post("/api/queue/clear")
+def clear_queue():
+    with _queue_lock:
+        while not _task_queue.empty():
+            try:
+                _task_queue.get_nowait()
+                _task_queue.task_done()
+            except Exception:
+                pass
+        BATCH_QUEUE["is_running"] = False
+        BATCH_QUEUE["total"] = 0
+        BATCH_QUEUE["current_index"] = 0
+        BATCH_QUEUE["current_title"] = ""
+        BATCH_QUEUE["percent"] = 0
+        BATCH_QUEUE["items"] = []
+    return JSONResponse({"ok": True, "queue": BATCH_QUEUE})
+
+@app.post("/api/playlist/inspect")
+async def inspect_playlist(request: Request):
+    """探測解析播放清單、頻道或多連結，回傳影片項目供前端勾選"""
+    body = await request.json()
+    raw_text = (body.get("text") or body.get("url") or "").strip()
+    if not raw_text:
+        raise HTTPException(status_code=400, detail="請輸入網址或播放清單連結")
+
+    # 提取所有合法的 http/https 網址
+    found_urls = [u.strip() for u in re.split(r"[\r\n,\s]+", raw_text) if re.match(r"^https?://", u.strip())]
+    if not found_urls:
+        raise HTTPException(status_code=400, detail="未找到有效的網址")
+
+    # 若只有 1 個網址，且可能是播放清單 / 頻道 Shorts
+    if len(found_urls) == 1:
+        u = found_urls[0]
+        pl_data = parse_playlist_or_channel(u)
+        if pl_data and pl_data.get("items"):
+            return JSONResponse({"ok": True, "is_playlist": True, "playlist": pl_data})
+
+    # 若是多個連結，或者單一影片非播放清單
+    items = []
+    for idx, u in enumerate(found_urls, 1):
+        items.append({
+            "index": idx,
+            "id": f"link_{idx}",
+            "title": u,
+            "url": u,
+            "duration": 0,
+            "duration_str": "",
+        })
+    return JSONResponse({
+        "ok": True,
+        "is_playlist": False,
+        "playlist": {
+            "title": f"批次貼上連結 ({len(items)} 部影片)",
+            "total": len(items),
+            "items": items,
+        }
+    })
+
+@app.post("/api/batch/submit")
+async def submit_batch(request: Request):
+    """接收勾選的多部影片並加入排隊轉換佇列"""
+    body = await request.json()
+    items = body.get("items") or []
+    if not items:
+        raise HTTPException(status_code=400, detail="請至少勾選一部影片")
+    src_langs = body.get("src_langs") or ["auto"]
+    tgt_langs = body.get("tgt_langs") or ["zh-TW"]
+
+    added_count = 0
+    with _queue_lock:
+        if not BATCH_QUEUE["is_running"] and _task_queue.empty():
+            BATCH_QUEUE["total"] = 0
+            BATCH_QUEUE["current_index"] = 0
+            BATCH_QUEUE["percent"] = 0
+            BATCH_QUEUE["items"] = []
+
+        for it in items:
+            u = it.get("url")
+            if not u:
+                continue
+            t_id = f"task_{int(time.time()*1000)}_{added_count}"
+            task_obj = {
+                "id": t_id,
+                "title": it.get("title") or u,
+                "url": u,
+                "src_langs": src_langs,
+                "tgt_langs": tgt_langs,
+                "status": "pending",
+                "step": "排隊中",
+                "job_id": None,
+            }
+            BATCH_QUEUE["items"].append(task_obj)
+            BATCH_QUEUE["total"] += 1
+            _task_queue.put(task_obj)
+            added_count += 1
+
+    return JSONResponse({
+        "ok": True,
+        "added": added_count,
+        "queue_total": BATCH_QUEUE["total"]
+    })
+
 @app.post("/api/upload")
 async def upload_video(
     file: UploadFile = File(...),
@@ -658,6 +873,9 @@ HTML_CONTENT = """<!DOCTYPE html>
           <input id="ytUrlInput" type="url" placeholder="貼上 YouTube 連結..." onkeydown="if(event.key==='Enter')submitYoutubeUrl()" class="bg-transparent text-xs px-3 py-1.5 text-gray-200 focus:outline-none w-48 sm:w-64">
           <button onclick="submitYoutubeUrl()" class="px-3 py-1.5 bg-red-600 hover:bg-red-500 text-white text-xs font-medium transition whitespace-nowrap">🔗 載入 YT</button>
         </div>
+        <button onclick="openBatchModal()" class="px-3 py-1.5 rounded-lg bg-gradient-to-r from-red-700 to-rose-600 hover:from-red-600 hover:to-rose-500 text-white font-medium transition flex items-center gap-1.5 shadow" title="支援播放清單或一次貼上多個 YouTube / 影片網址，勾選後批次排隊處理">
+          <span>📋 播放清單 / 批次</span>
+        </button>
         <input type="file" id="uploadInput" accept="video/*" class="hidden" onchange="uploadNewVideo(this)">
         <button onclick="document.getElementById('uploadInput').click()" class="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition flex items-center gap-1.5 shadow">
           <span>📤 上傳檔案</span>
@@ -673,6 +891,24 @@ HTML_CONTENT = """<!DOCTYPE html>
           <span>📥 VTT</span>
         </a>
       </div>
+    </div>
+    <!-- Batch / Job Global Progress Bar Banner -->
+    <div id="queueProgressBanner" class="hidden bg-gray-950/90 border border-blue-900/60 rounded-lg p-2.5 flex flex-col gap-1.5 shadow-inner">
+      <div class="flex items-center justify-between text-xs">
+        <div class="flex items-center gap-2">
+          <span class="inline-block w-2.5 h-2.5 rounded-full bg-blue-400 animate-pulse"></span>
+          <span id="queueProgressTitle" class="font-medium text-gray-200 truncate max-w-md sm:max-w-xl">批次排隊處理中...</span>
+        </div>
+        <div class="flex items-center gap-3 font-mono text-[11px] text-gray-400">
+          <span id="queueProgressCount" class="text-blue-300">進度: 0 / 0</span>
+          <span id="queueProgressPercent" class="font-bold text-emerald-400">0%</span>
+          <button onclick="clearBatchQueue()" class="text-red-400 hover:text-red-300 ml-1 px-1.5 py-0.5 rounded border border-red-900/80 hover:bg-red-950/60 text-[10px]">清空排隊</button>
+        </div>
+      </div>
+      <div class="w-full bg-gray-800 rounded-full h-2 overflow-hidden">
+        <div id="queueProgressBar" class="bg-gradient-to-r from-blue-500 via-indigo-500 to-emerald-400 h-2 rounded-full transition-all duration-300" style="width: 0%"></div>
+      </div>
+      <div id="queueCurrentStep" class="text-[11px] text-gray-400 font-mono truncate">等待中...</div>
     </div>
     <!-- Multi-select Language & Card Style Bar -->
     <div class="flex flex-wrap items-center justify-between gap-x-6 gap-y-1.5 text-xs border-t border-gray-800/80 pt-2 text-gray-300">
@@ -790,6 +1026,69 @@ HTML_CONTENT = """<!DOCTYPE html>
       </div>
     </div>
   </main>
+
+  <!-- Batch / Playlist Import Modal -->
+  <div id="batchModal" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+    <div class="bg-gray-900 border border-gray-700 rounded-2xl w-full max-w-3xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden">
+      <!-- Modal Header -->
+      <div class="px-6 py-4 border-b border-gray-800 flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          <div class="w-7 h-7 rounded bg-red-600/30 border border-red-500 text-red-300 flex items-center justify-center text-sm font-bold">📋</div>
+          <div>
+            <h3 class="font-bold text-gray-100 text-base">批次解析與排隊上傳</h3>
+            <p class="text-xs text-gray-400">支援 YouTube 播放清單網址、頻道 Shorts 分頁或直接貼上多部影片網址</p>
+          </div>
+        </div>
+        <button onclick="closeBatchModal()" class="text-gray-400 hover:text-gray-200 text-lg font-bold p-1">✕</button>
+      </div>
+
+      <!-- Modal Body -->
+      <div class="p-6 overflow-y-auto space-y-4 flex-1 text-xs">
+        <div>
+          <label class="block text-gray-300 font-medium mb-1.5">貼上播放清單網址 或 多行影片連結（以換行或空格分隔）：</label>
+          <textarea id="batchInputUrls" rows="4" placeholder="例如：&#10;https://www.youtube.com/playlist?list=PLxxxxxx&#10;或&#10;https://www.youtube.com/watch?v=aaa&#10;https://www.youtube.com/watch?v=bbb" class="w-full bg-gray-950 border border-gray-700 rounded-lg p-3 text-gray-200 font-mono text-xs focus:outline-none focus:border-blue-500"></textarea>
+        </div>
+
+        <div class="flex items-center justify-between flex-wrap gap-2">
+          <button id="btnInspectBatch" onclick="inspectBatchUrls()" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg font-medium transition flex items-center gap-1.5 shadow">
+            <span>🔍 快速解析清單 / 連結</span>
+          </button>
+          <span id="batchInspectStatus" class="text-gray-400 font-mono"></span>
+        </div>
+
+        <!-- Parsed Video Items Container (hidden initially) -->
+        <div id="batchItemsContainer" class="hidden space-y-2 border-t border-gray-800 pt-4">
+          <div class="flex items-center justify-between flex-wrap gap-2 bg-gray-950 p-2.5 rounded-lg border border-gray-800">
+            <div class="flex items-center gap-2">
+              <span id="batchListSummary" class="font-medium text-gray-200">解析結果 (0 部影片)</span>
+              <span class="text-gray-500">|</span>
+              <span id="batchSelectedSummary" class="text-emerald-400 font-mono">已勾選: 0 部</span>
+            </div>
+            <div class="flex items-center gap-2">
+              <button onclick="toggleAllBatchItems(true)" class="px-2 py-1 bg-gray-800 hover:bg-gray-700 text-gray-200 rounded border border-gray-700 text-[11px]">全選</button>
+              <button onclick="toggleAllBatchItems(false)" class="px-2 py-1 bg-gray-800 hover:bg-gray-700 text-gray-200 rounded border border-gray-700 text-[11px]">全不選</button>
+              <button onclick="invertBatchSelection()" class="px-2 py-1 bg-gray-800 hover:bg-gray-700 text-gray-200 rounded border border-gray-700 text-[11px]">反選</button>
+            </div>
+          </div>
+
+          <div id="batchItemsList" class="max-h-64 overflow-y-auto space-y-1.5 pr-1 divide-y divide-gray-800/60">
+            <!-- Dynamic Video Items with Checkboxes -->
+          </div>
+        </div>
+      </div>
+
+      <!-- Modal Footer -->
+      <div class="px-6 py-3.5 bg-gray-950/80 border-t border-gray-800 flex items-center justify-between">
+        <span class="text-xs text-gray-400">系統將依序自動下載、抽幀、全域去噪翻譯，並即時更新進度條</span>
+        <div class="flex items-center gap-2">
+          <button onclick="closeBatchModal()" class="px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 text-xs font-medium transition">取消</button>
+          <button id="btnSubmitBatch" onclick="submitBatchTasks()" class="px-5 py-2 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-500 hover:from-emerald-500 hover:to-teal-400 text-white text-xs font-bold transition flex items-center gap-1.5 shadow-lg disabled:opacity-50 disabled:cursor-not-allowed">
+            <span>🚀 開始批次排隊轉換</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <script>
     const video = document.getElementById('videoPlayer');
@@ -1179,12 +1478,189 @@ HTML_CONTENT = """<!DOCTYPE html>
       pollStatus();
     }
 
+    // Batch / Playlist Functions
+    let parsedBatchItems = [];
+
+    function openBatchModal() {
+      document.getElementById('batchModal').classList.remove('hidden');
+    }
+
+    function closeBatchModal() {
+      document.getElementById('batchModal').classList.add('hidden');
+    }
+
+    async function inspectBatchUrls() {
+      const text = document.getElementById('batchInputUrls').value.trim();
+      const statusEl = document.getElementById('batchInspectStatus');
+      const btn = document.getElementById('btnInspectBatch');
+      if (!text) {
+        statusEl.innerText = '請先輸入網址';
+        statusEl.className = 'text-amber-400 font-mono';
+        return;
+      }
+      btn.disabled = true;
+      btn.innerText = '⏳ 解析探測中...';
+      statusEl.innerText = '連線取得影片清單中...';
+      statusEl.className = 'text-blue-400 font-mono';
+
+      try {
+        const res = await fetch('/api/playlist/inspect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          statusEl.innerText = `❌ ${data.detail || '解析失敗'}`;
+          statusEl.className = 'text-red-400 font-mono';
+          return;
+        }
+
+        const pl = data.playlist;
+        parsedBatchItems = (pl.items || []).map(it => ({ ...it, selected: true }));
+        renderBatchItems(pl.title);
+        statusEl.innerText = `✅ 解析成功，共 ${parsedBatchItems.length} 部影片`;
+        statusEl.className = 'text-emerald-400 font-mono';
+      } catch (err) {
+        statusEl.innerText = `❌ 連線錯誤: ${err}`;
+        statusEl.className = 'text-red-400 font-mono';
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<span>🔍 快速解析清單 / 連結</span>';
+      }
+    }
+
+    function renderBatchItems(title) {
+      const container = document.getElementById('batchItemsContainer');
+      const listEl = document.getElementById('batchItemsList');
+      const summaryEl = document.getElementById('batchListSummary');
+      container.classList.remove('hidden');
+      summaryEl.innerText = `${title || '影片清單'} (${parsedBatchItems.length} 部)`;
+
+      listEl.innerHTML = parsedBatchItems.map((item, idx) => `
+        <div class="flex items-center justify-between p-2 rounded hover:bg-gray-800/80 transition text-xs gap-3">
+          <label class="flex items-center gap-2.5 min-w-0 flex-1 cursor-pointer">
+            <input type="checkbox" data-idx="${idx}" ${item.selected ? 'checked' : ''} onchange="toggleBatchItem(${idx}, this.checked)" class="accent-emerald-500 w-4 h-4 rounded">
+            <span class="font-mono text-gray-500 text-[11px] w-6 shrink-0">#${item.index}</span>
+            <div class="min-w-0 flex-1 truncate">
+              <span class="text-gray-200 font-medium">${item.title}</span>
+              <span class="text-gray-500 font-mono text-[11px] block truncate">${item.url}</span>
+            </div>
+          </label>
+          ${item.duration_str ? `<span class="shrink-0 text-gray-400 font-mono text-[11px] bg-gray-800 px-2 py-0.5 rounded">${item.duration_str}</span>` : ''}
+        </div>
+      `).join('');
+
+      updateBatchSelectedCount();
+    }
+
+    function toggleBatchItem(idx, checked) {
+      if (parsedBatchItems[idx]) {
+        parsedBatchItems[idx].selected = checked;
+        updateBatchSelectedCount();
+      }
+    }
+
+    function toggleAllBatchItems(val) {
+      parsedBatchItems.forEach(it => it.selected = val);
+      document.querySelectorAll('#batchItemsList input[type="checkbox"]').forEach(cb => cb.checked = val);
+      updateBatchSelectedCount();
+    }
+
+    function invertBatchSelection() {
+      parsedBatchItems.forEach(it => it.selected = !it.selected);
+      document.querySelectorAll('#batchItemsList input[type="checkbox"]').forEach(cb => cb.checked = !cb.checked);
+      updateBatchSelectedCount();
+    }
+
+    function updateBatchSelectedCount() {
+      const count = parsedBatchItems.filter(it => it.selected).length;
+      document.getElementById('batchSelectedSummary').innerText = `已勾選: ${count} 部`;
+      const submitBtn = document.getElementById('btnSubmitBatch');
+      submitBtn.disabled = (count === 0);
+    }
+
+    async function submitBatchTasks() {
+      const selected = parsedBatchItems.filter(it => it.selected);
+      if (!selected.length) return;
+      const src_langs = getSelectedLangs('srcLang', ['auto']);
+      const tgt_langs = getSelectedLangs('tgtLang', ['zh-TW']);
+      const submitBtn = document.getElementById('btnSubmitBatch');
+      submitBtn.disabled = true;
+      submitBtn.innerText = '⏳ 提交排隊中...';
+
+      try {
+        const res = await fetch('/api/batch/submit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items: selected, src_langs, tgt_langs })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          closeBatchModal();
+          pollStatus();
+        } else {
+          alert(`提交失敗: ${data.detail || '未知錯誤'}`);
+        }
+      } catch (err) {
+        alert(`提交錯誤: ${err}`);
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = '<span>🚀 開始批次排隊轉換</span>';
+      }
+    }
+
+    async function clearBatchQueue() {
+      if (!confirm('確定要清空目前所有排隊中的批次任務嗎？')) return;
+      await fetch('/api/queue/clear', { method: 'POST' });
+      pollStatus();
+    }
+
     async function pollStatus() {
       const badge = document.getElementById('jobBadge');
-      const res = await fetch('/api/status');
-      const st = await res.json();
+      const banner = document.getElementById('queueProgressBanner');
+      const progressBar = document.getElementById('queueProgressBar');
+      const progressTitle = document.getElementById('queueProgressTitle');
+      const progressCount = document.getElementById('queueProgressCount');
+      const progressPercent = document.getElementById('queueProgressPercent');
+      const currentStep = document.getElementById('queueCurrentStep');
+
+      const [statusRes, queueRes] = await Promise.all([
+        fetch('/api/status'),
+        fetch('/api/queue')
+      ]);
+
+      const st = await statusRes.json();
+      const q = await queueRes.json();
+
       if (st.title) document.getElementById('videoSubtitle').innerText = `${st.title} (全域上下文分析 + 畫面字卡 OCR 提取)`;
-      if (st.state === 'running') {
+
+      // 進度條控制 (Batch Queue 或 單片 Job 狀態)
+      const hasQueue = q && (q.is_running || q.total > 1 || (q.items && q.items.length > 0));
+      if (hasQueue) {
+        banner.classList.remove('hidden');
+        progressTitle.innerText = q.is_running ? `正在處理: ${q.current_title || '影片'}` : (q.percent === 100 ? '✅ 全部批次處理完成' : '佇列已暫停');
+        progressCount.innerText = `進度: ${q.current_index} / ${q.total} 部`;
+        progressPercent.innerText = `${q.percent}%`;
+        progressBar.style.width = `${q.percent}%`;
+        currentStep.innerText = st.step || '排隊執行中...';
+      } else if (st.state === 'running') {
+        banner.classList.remove('hidden');
+        progressTitle.innerText = `正在處理: ${st.title || '影片'}`;
+        progressCount.innerText = '單片處理模式';
+        let pct = 10;
+        if (st.step.includes('0/4')) pct = 25;
+        else if (st.step.includes('1-2/4') || st.step.includes('1/4')) pct = 55;
+        else if (st.step.includes('3/4')) pct = 85;
+        else if (st.step.includes('4/4')) pct = 95;
+        progressPercent.innerText = `${pct}%`;
+        progressBar.style.width = `${pct}%`;
+        currentStep.innerText = st.step;
+      } else {
+        banner.classList.add('hidden');
+      }
+
+      if (st.state === 'running' || (q && q.is_running)) {
         badge.classList.remove('hidden');
         badge.innerText = `⏳ ${st.step}`;
         setTimeout(pollStatus, 2500);
