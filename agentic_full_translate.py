@@ -402,9 +402,10 @@ def run_translation_pipeline():
 
 請通讀全篇內容，完成「全域情境分析與【{tgt_desc}】專有名詞對照表」（控制在 600–800 字內）：
 1. 本片核心情境與脈絡（主題、笑點或重點是什麼？）
-2. 重要術語、人名與網路梗對應至【{tgt_desc}】的標準譯法對照表（嚴禁輸出繁中/簡中譯名！必須直接給出【{tgt_desc}】在地化譯法，如日文請用片假名/日文漢字/VTuber用語）。
+2. 重要術語、人名與網路梗對應至【{tgt_desc}】的標準譯法對照表（嚴禁輸出非目標語言之譯名！必須直接給出【{tgt_desc}】在地化譯法，如日文請用片假名/日文漢字/VTuber用語）。
    特別注意：畫面擷取的字卡可能包含 OCR 辨識殘缺、斷字或 VTuber 側邊聊天室觀眾留言，請依據人物與語音上下文將其校正還原為正確名稱或句子，並在對照表中列出標準【{tgt_desc}】譯法。
 3. 針對【{tgt_desc}】的翻譯語氣指導（口吻、標點習慣）。
+【重要語言規範】：請一律使用繁體中文撰寫情境分析與語氣指導（對照表目標欄位請直接給予精確地道的【{tgt_desc}】），絕對禁止輸出英文說明，避免對後續翻譯造成語系干擾！
 只輸出分析與名詞表，不要輸出翻譯。
 """
 
@@ -427,11 +428,63 @@ def run_translation_pipeline():
     # STAGE 2: 注入全局背景，逐段依上下文自然意譯
     print(f"Stage 2: Context-aware translation based on global knowledge using [{llm_model_id}]...")
 
-    no_zh_warning = "" if "zh-TW" in llm_tgt_langs else f"（注意：目標語言為 {tgt_desc}，絕對禁止輸出中文！）"
+    disallowed_notes = []
+    if "zh-TW" not in llm_tgt_langs:
+        disallowed_notes.append("絕對禁止輸出中文")
+    if "en" not in llm_tgt_langs:
+        disallowed_notes.append("絕對禁止輸出英文 (English)")
+    if "ko" not in llm_tgt_langs:
+        disallowed_notes.append("絕對禁止保留韓文原文 (Hangul)")
+    if "ja" not in llm_tgt_langs:
+        disallowed_notes.append("絕對禁止輸出日文假名")
+
+    disallowed_str = "、".join(disallowed_notes)
+    lang_ban_rule = f"（嚴格警告：目標語言唯一為【{tgt_desc}】，{disallowed_str}！所有對白與字卡必須 100% 翻譯為【{tgt_desc}】！）"
+
+    if "ja" in llm_tgt_langs:
+        few_shot_example = """【字卡輸出範例】
+輸入：
+1
+내가 고쳐줄게.
+【字卡】자세 교정 이야기 중
+【字卡】시청자: 진짜 웃기네 ㅋㅋㅋ
+
+輸出：
+1
+直してあげるよ。
+【字卡】姿勢矯正の話の最中
+【字卡】リスナー：マジでウケるwww"""
+    elif "en" in llm_tgt_langs:
+        few_shot_example = """【字卡輸出範例】
+輸入：
+1
+내가 고쳐줄게.
+【字卡】자세 교정 이야기 중
+【字卡】시청자: 진짜 웃기네 ㅋㅋㅋ
+
+輸出：
+1
+I'll fix it for you.
+【字卡】Talking about posture correction
+【字卡】Viewer: That's hilarious lol"""
+    else:
+        few_shot_example = """【字卡輸出範例】
+輸入：
+1
+내가 고쳐줄게.
+【字卡】자세 교정 이야기 중
+【字卡】시청자: 진짜 웃기네 ㅋㅋㅋ
+
+輸出：
+1
+我會幫妳修好。
+【字卡】姿勢矯正話題進行中
+【字卡】觀眾：真的超好笑哈哈哈"""
+
     multi_lang_rule = (
-        f"1. 目標字幕語言為：{tgt_desc}。每個字幕區塊請依序輸出一行對應語言的翻譯（共 {len(llm_tgt_langs)} 行對白）{no_zh_warning}。"
+        f"1. 目標字幕語言為：{tgt_desc}。每個字幕區塊請依序輸出一行對應語言的翻譯（共 {len(llm_tgt_langs)} 行對白）{lang_ban_rule}。"
         if len(llm_tgt_langs) > 1 else
-        f"1. 請將所有字幕完整翻譯為【{tgt_desc}】{no_zh_warning}。"
+        f"1. 請將所有字幕完整翻譯為【{tgt_desc}】{lang_ban_rule}。"
     )
 
     stage2_system = f"""你是一位頂級影視與 Vtuber 多語翻譯專家。你剛剛已經通讀了全篇影片並建立了以下背景知識庫：
@@ -446,26 +499,9 @@ def run_translation_pipeline():
    - 【多則留言獨立分行（嚴禁雜湊）】：若同一字幕條目下有多行【字卡】（例如多則 VTuber 側邊觀眾留言，或主字卡加側邊留言），每一則【字卡】必須各自獨立輸出一行「【字卡】<譯文>」，絕對不可將多則留言或多個字卡合併擠在同一行！若單一【字卡】原文內夾雜了兩則以上不同觀眾的留言，也請將它們拆分成多行獨立的「【字卡】<譯文>」。
    - 【絕對禁止原文與雙重行】：嚴禁留下未翻譯的原文字卡（如韓文 Hangul、日文假名）！同一則【字卡】只輸出【{tgt_desc}】譯文，不可同時輸出原文與譯文雙重行！
 4. 輸入每個區塊格式為「序號 / 原文 /（可選，一至多行）【字卡】」，沒有時間軸。輸出請保持相同格式（第一行序號，其後為對白譯文行與獨立的【字卡】譯文行），區塊之間以空行分隔，不得輸出時間軸，不得跳過或刪減序號。
-5. 只輸出翻譯後的區塊內容，不要包含 Markdown 代碼標籤或額外解說。{no_zh_warning}
+5. 只輸出翻譯後的區塊內容，不要包含 Markdown 代碼標籤或額外解說。{lang_ban_rule}
 
-【字卡輸出範例】
-輸入：
-1
-내가 고쳐줄게.
-【字卡】자세 교정 이야기 중
-【字卡】시청자: 진짜 웃기네 ㅋㅋㅋ
-
-輸出（若目標為繁中）：
-1
-我會幫妳修好。
-【字卡】姿勢矯正話題進行中
-【字卡】觀眾：真的超好笑哈哈哈
-
-輸出（若目標為日文）：
-1
-直してあげるよ。
-【字卡】姿勢矯正の話の最中
-【字卡】リスナー：マジでウケるwww
+{few_shot_example}
 """
 
     # 組裝包含字卡註記的翻譯區塊
@@ -478,7 +514,7 @@ def run_translation_pipeline():
         res = call_llm_chat(
             messages=[
                 {"role": "system", "content": stage2_system},
-                {"role": "user", "content": f"請將以下字幕翻譯為【{tgt_desc}】{no_zh_warning}。\n【重要指令】：凡有【字卡】之條目，必須保留【字卡】前綴並將其內容 100% 翻譯為【{tgt_desc}】；若有多行【字卡】（如多則側邊留言），請務必逐行獨立輸出【字卡】，絕對不可合併成同一行，也不可保留未翻譯的韓文/日文原文！\n\n{chunk_text}"},
+                {"role": "user", "content": f"請將以下字幕 100% 翻譯為【{tgt_desc}】{lang_ban_rule}。\n【重要指令】：凡有【字卡】之條目，必須保留【字卡】前綴並將其內容 100% 翻譯為【{tgt_desc}】；若有多行【字卡】（如多則側邊留言），請務必逐行獨立輸出【字卡】，絕對不可合併成同一行，{disallowed_str}！\n\n{chunk_text}"},
             ],
             temperature=0.2,
             max_tokens=4096,
@@ -592,13 +628,20 @@ def run_translation_pipeline():
     if untranslated_cards:
         print(f"Detected {len(untranslated_cards)} untranslated card lines. Running targeted LLM repair pass [{llm_model_id}]...")
         repair_lines = "\n".join([f"{cid}_{c_idx}: {c.replace('【字卡】', '').strip()}" for cid, c_idx, c in untranslated_cards])
+        if "ja" in llm_tgt_langs:
+            repair_ex_out = "1_0: 【字卡】姿勢矯正の話の最中"
+        elif "en" in llm_tgt_langs:
+            repair_ex_out = "1_0: 【字卡】Talking about posture correction"
+        else:
+            repair_ex_out = "1_0: 【字卡】姿勢矯正話題進行中"
+
         repair_prompt = f"""你是一位頂級影視在地化專家。請將以下影片畫面中的字卡或側邊留言逐行翻譯為【{tgt_desc}】：
-注意：原字卡可能包含綜藝特效字帶來的 OCR 殘缺或錯字，請依語意校正並翻譯為自然流暢的【{tgt_desc}】。每行對應一則獨立字卡或留言，請勿將不同行合併！
-格式要求：每行輸出必須為「編號: 【字卡】<譯文>」（「【字卡】」三個字請逐字保留作為前綴，不可替換為原文，嚴禁輸出韓文/日文原文！）：
+注意：原字卡可能包含綜藝特效字帶來的 OCR 殘缺或錯字，請依語意校正並翻譯為自然流暢的【{tgt_desc}】。每行對應一則獨立字卡或留言，請勿將不同行合併！{lang_ban_rule}
+格式要求：每行輸出必須為「編號: 【字卡】<譯文>」（「【字卡】」三個字請逐字保留作為前綴，不可替換為原文，{disallowed_str}！）：
 
 範例：
 輸入：1_0: 자세 교정 이야기 중
-輸出：1_0: 【字卡】姿勢矯正話題進行中
+輸出：{repair_ex_out}
 
 {repair_lines}"""
 
